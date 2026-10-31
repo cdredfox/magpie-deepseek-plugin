@@ -249,7 +249,7 @@ function stubFetch(completionBody, { completionStatus = 200, contentType = "text
     throw new Error(`stub: 未预期的请求 ${u}`);
   };
 }
-const plugin = await DeepSeekWebPlugin(null, {});
+const plugin = await DeepSeekWebPlugin(null, { retryAttempts: 2, retryBackoffMs: 5 });
 const loader = await plugin.auth.loader(async () => ({ type: "api", key: "tok" }));
 
 await okAsync("空流（非流式）→ 502 显式错误", async () => {
@@ -297,6 +297,58 @@ await okAsync("回答里的调用块 → tool_calls 结构", async () => {
   assert.equal(j.choices[0].finish_reason, "tool_calls");
   assert.equal(j.choices[0].message.tool_calls[0].function.name, "bash");
   assert.equal(j.choices[0].message.tool_calls[0].function.arguments, '{"command":"ls"}');
+});
+await okAsync("空流重试：第一次空、第二次有内容 → 成功返回", async () => {
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("/chat_session/create")) return new Response('{"code":0,"data":{"biz_data":{"chat_session":{"id":"s"}}}}', { status: 200 });
+    if (u.includes("/chat/create_pow_challenge")) {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: { challenge: { algorithm: "DeepSeekHashV1", challenge: "ea415cd70d0c9dabf1893bac23eacfe972349d254499dde39a3110d0badc18c0", salt: "4afc5c7d56f0ff06e1bf", signature: "4043caabdec7c7c35f1cc181143089d51969ddf3e578a20b0afcd5bd01269e43", difficulty: 144000, expire_at: 1793414496131, expire_after: 300000, target_path: "/api/v0/chat/completion" } } } }), { status: 200 });
+    }
+    if (u.includes("/chat/completion")) {
+      calls++;
+      if (calls === 1) return new Response("", { status: 200, headers: { "content-type": "text/event-stream" } });
+      return new Response(SSE_OK, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    if (u.includes("/chat_session/delete")) return new Response('{"code":0}', { status: 200 });
+    throw new Error(`stub: 未预期的请求 ${u}`);
+  };
+  const r = await loader.fetch(null, { body: JSON.stringify({ model: "deepseek-chat", stream: false, messages: [{ role: "user", content: "hi" }] }) });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.choices[0].message.content, "回答第一段第二段");
+  assert.equal(calls, 2, "应正好尝试 2 次");
+});
+await okAsync("空流重试：流式模式下重试对客户端透明", async () => {
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("/chat_session/create")) return new Response('{"code":0,"data":{"biz_data":{"chat_session":{"id":"s"}}}}', { status: 200 });
+    if (u.includes("/chat/create_pow_challenge")) {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: { challenge: { algorithm: "DeepSeekHashV1", challenge: "ea415cd70d0c9dabf1893bac23eacfe972349d254499dde39a3110d0badc18c0", salt: "4afc5c7d56f0ff06e1bf", signature: "4043caabdec7c7c35f1cc181143089d51969ddf3e578a20b0afcd5bd01269e43", difficulty: 144000, expire_at: 1793414496131, expire_after: 300000, target_path: "/api/v0/chat/completion" } } } }), { status: 200 });
+    }
+    if (u.includes("/chat/completion")) {
+      calls++;
+      if (calls === 1) return new Response("", { status: 200, headers: { "content-type": "text/event-stream" } });
+      return new Response(SSE_OK, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    if (u.includes("/chat_session/delete")) return new Response('{"code":0}', { status: 200 });
+    throw new Error(`stub: 未预期的请求 ${u}`);
+  };
+  const r = await loader.fetch(null, { body: JSON.stringify({ model: "deepseek-chat", stream: true, messages: [{ role: "user", content: "hi" }] }) });
+  assert.equal(r.status, 200);
+  const body = await r.text();
+  assert.equal(calls, 2, "应正好尝试 2 次");
+  const content = body
+    .split("\n")
+    .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+    .map((l) => { try { return JSON.parse(l.slice(6)); } catch { return null; } })
+    .filter((c) => c?.choices?.[0]?.delta?.content)
+    .map((c) => c.choices[0].delta.content)
+    .join("");
+  assert.equal(content, "回答第一段第二段");
+  assert.ok(body.includes("[DONE]") && !body.includes('"error"'));
 });
 await okAsync("40003/INVALID_TOKEN → 401 + 登录标记", async () => {
   globalThis.fetch = async (url) => {

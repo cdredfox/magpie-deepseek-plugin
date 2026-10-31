@@ -1,6 +1,6 @@
 {
   "name": "magpie-deepseek-web",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "把 DeepSeek 网页版（chat.deepseek.com）代理成 magpie 供应商，通过 API 调用网页版模型",
   "type": "module",
   "main": "./index.mjs",
