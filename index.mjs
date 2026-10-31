@@ -1,29 +1,91 @@
-// magpie-deepseek-web —— 把 DeepSeek 网页版（chat.deepseek.com）代理成 magpie 供应商。
+// magpie-deepseek-web —— 把 DeepSeek 网页版（chat.deepseek.com）代理成 magpie 的一个供应商。
 //
 // 网页版协议（已实测，2026-10）：
 //   鉴权：Authorization: Bearer <userToken>（网页版 localStorage 里的 userToken）
 //   流程：POST /api/v0/chat_session/create → POST /api/v0/chat/create_pow_challenge
 //         → 本地解 PoW（DeepSeekHashV1，官方 sha3 wasm）→ POST /api/v0/chat/completion（SSE）
 //   PoW 头：x-ds-pow-response = base64(JSON{algorithm,challenge,salt,answer,signature,target_path})
-//   其余 x-client-* / x-hif-* 头服务端不强制要求。
+//   会话复用：event: ready 帧带 response_message_id，作为下一轮 parent_message_id，
+//             配合增量 prompt（只发新增尾部）把 agent 循环的输入吞吐降一个数量级。
+//   错误分类：SSE event: hint/toast (type=error) 与 JSON 200 的 biz_code=5（禁言）
+//             都会伪装成"成功但空"，必须显式识别（参考 freeapi / web2api 两个逆向项目）。
 //
 // magpie 的网关把智能体的请求转成 OpenAI chat completions 发进这里的 fetch，
 // 本插件负责转成网页版格式、再把它的事件流补丁转回 OpenAI chunk。
 
 import { powResponseHeader } from "./pow.mjs";
-import { buildPrompt, SseTranslator, ToolCallStream, extractImages, extractAttachments } from "./lib.mjs";
+import { buildPromptParts, SseTranslator, StreamSieve, extractImages, extractAttachments, estimateTokens, sanitizeLeaked } from "./lib.mjs";
 
 const PROVIDER = "deepseek-web";
 const BASE = "https://chat.deepseek.com/api/v0";
 
 const MODEL_DEFS = {
-  "deepseek-chat": { name: "DeepSeek（网页版）", thinking: false, reasoning: false },
-  "deepseek-reasoner": { name: "DeepSeek 深度思考（网页版）", thinking: true, reasoning: true },
+  "deepseek-chat": { name: "DeepSeek（网页版）", thinking: false, search: false },
+  "deepseek-reasoner": { name: "DeepSeek 深度思考（网页版）", thinking: true, search: false },
+  "deepseek-search": { name: "DeepSeek 联网搜索（网页版）", thinking: false, search: true },
+  "deepseek-reasoner-search": { name: "DeepSeek 深度思考+联网（网页版）", thinking: true, search: true },
 };
 
 function modelDef(model) {
-  if (typeof model === "string" && model.includes("reasoner")) return MODEL_DEFS["deepseek-reasoner"];
+  const id = String(model ?? "deepseek-chat");
+  if (id.includes("reasoner-search")) return MODEL_DEFS["deepseek-reasoner-search"];
+  if (id.includes("reasoner")) return MODEL_DEFS["deepseek-reasoner"];
+  if (id.includes("search")) return MODEL_DEFS["deepseek-search"];
   return MODEL_DEFS["deepseek-chat"];
+}
+
+// 风控画像：补齐真实浏览器会带的头（参考 web2api 从 Chrome 抓包的头清单）
+const BROWSER_HEADERS = {
+  "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+  accept: "*/*",
+  "accept-language": "zh-CN,zh;q=0.9,en;q=0.7",
+  origin: "https://chat.deepseek.com",
+  referer: "https://chat.deepseek.com/",
+  priority: "u=1, i",
+  "sec-ch-ua": '"Google Chrome";v="141", "Chromium";v="141", "Not_A Brand";v="24"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"macOS"',
+  "sec-fetch-dest": "empty",
+  "sec-fetch-mode": "cors",
+  "sec-fetch-site": "same-origin",
+  "x-client-version": "2.3.0",
+  "x-client-platform": "web",
+  "x-client-locale": "zh_CN",
+  "x-client-timezone-offset": "28800",
+  "x-client-bundle-id": "com.deepseek.chat",
+};
+
+const EMPTY_RESPONSE_MSG = "DeepSeek 返回了空回答（重试后仍为空；可能触发风控/限流冷却或服务端异常），请稍后重试或换模型";
+const SESSION_TTL_MS = 30 * 60 * 1000; // 会话复用窗口：30 分钟
+const MAX_CONTEXT_TOKENS = 900000; // 1M 留 10%（freeapi 的 session 续期阈值）
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function authError(message) {
+  return Object.assign(new Error(message), { auth: true });
+}
+
+function muteError(message) {
+  return Object.assign(new Error(message), { mute: true });
+}
+
+// DeepSeek 有些失败用 HTTP 200 + JSON 业务码返回，也有些直接 401
+function looksLikeAuthFailure(status, text) {
+  if (status === 401) return true;
+  return /\b40100\b|\b40101\b|\b40003\b|INVALID_TOKEN|unauthorized|token.{0,12}(invalid|expired|无效|过期)/i.test(text.slice(0, 500));
+}
+
+// 账号禁言：普通 JSON 200（没有 SSE 通道），biz_code 5 / "user is muted"。
+// 不识别的话它会伪装成"成功但空"（web2api 的 UserMutedError）。
+function looksLikeMute(text) {
+  return /"biz_code"\s*:\s*5\b|"user is muted"|"is_mute"\s*:\s*true|muted?_until/i.test(text.slice(0, 800));
+}
+
+// WAF/CDN 挑战：IP 层风控，换账号或稍后再试（插件层报显式错误）
+function wafKind(response) {
+  if (response.headers.get("x-amzn-waf-action")) return "aws-waf";
+  if (response.headers.get("cf-mitigated") === "challenge") return "cloudflare";
+  return null;
 }
 
 async function postJson(token, path, body, signal) {
@@ -41,24 +103,13 @@ async function postJson(token, path, body, signal) {
   return { status: r.status, text, json };
 }
 
-async function deleteSession(token, sessionId) {
-  if (!sessionId) return;
-  try {
-    await postJson(token, "/chat_session/delete", { chat_session_ids: [sessionId] });
-  } catch {}
+async function sha256Hex(bytes) {
+  const h = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// ---- 文件上传（图片走 VISION 通道）----
-// 实测协议（2026-10）：
-//   create_pow_challenge(target_path=/api/v0/file/upload_file) → PoW
-//   POST /file/upload_file（multipart，字段 file）→ { id, model_kind: "VISION", status: "PENDING" }
-//   GET  /file/fetch_files?file_ids=…  轮询到非 PENDING（实测 ~2.5s SUCCESS）
-//   completion：model_type="vision" + ref_file_ids=[原始 id]（无需 fork）
-function authError(message) {
-  return Object.assign(new Error(message), { auth: true });
-}
-
-async function getPowHeader(token, targetPath, signal) {
+async function getPowHeader(token, targetPath, signal, jitterMs) {
+  if (jitterMs > 0) await sleep(Math.random() * jitterMs); // 打破匀速自动化节奏
   const ch = await postJson(token, "/chat/create_pow_challenge", { target_path: targetPath }, signal);
   const challenge = ch.json?.data?.biz_data?.challenge;
   if (ch.status !== 200 || !challenge) {
@@ -68,49 +119,98 @@ async function getPowHeader(token, targetPath, signal) {
   return powResponseHeader(challenge);
 }
 
-async function uploadFile(token, { mime, base64, url, name }, signal) {
-  let bytes;
-  let contentType = mime ?? "application/octet-stream";
+async function deleteSession(token, sessionId) {
+  if (!sessionId) return;
+  try {
+    await postJson(token, "/chat_session/delete", { chat_session_ids: [sessionId] });
+  } catch {}
+}
+
+// ---- 文件上传（图片走 VISION 通道）----
+//   create_pow_challenge(target_path=/api/v0/file/upload_file) → PoW
+//   POST /file/upload_file（multipart，字段 file；X-File-Size/X-Model-Type/X-Thinking-Enabled）
+//   GET /file/fetch_files?file_ids=…（重复参数，逗号分隔会被拒）轮询到非 PENDING
+//   completion：ref_file_ids=[原始 id] + model_type="vision"
+async function fetchFileBytes({ mime, base64, url }, signal, maxBytes) {
   if (base64) {
-    bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-  } else {
-    const r = await fetch(url, { signal });
-    if (!r.ok) throw new Error(`下载图片失败：HTTP ${r.status} ${url.slice(0, 120)}`);
-    bytes = new Uint8Array(await r.arrayBuffer());
-    contentType = r.headers.get("content-type")?.split(";")[0] ?? contentType;
+    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+    if (bytes.length > maxBytes) throw new Error(`图片超过大小限制：${bytes.length} > ${maxBytes} 字节`);
+    return { bytes, contentType: mime ?? "application/octet-stream" };
   }
-  const pow = await getPowHeader(token, "/api/v0/file/upload_file", signal);
+  const r = await fetch(url, { signal, headers: { accept: "image/*", "user-agent": BROWSER_HEADERS["user-agent"] } });
+  if (!r.ok) throw new Error(`下载图片失败：HTTP ${r.status} ${url.slice(0, 120)}`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  if (bytes.length > maxBytes) throw new Error(`图片超过大小限制：${bytes.length} > ${maxBytes} 字节`);
+  return { bytes, contentType: r.headers.get("content-type")?.split(";")[0] ?? mime ?? "application/octet-stream" };
+}
+
+async function uploadBytes(token, bytes, contentType, name, signal, { modelType, thinking }) {
+  const pow = await getPowHeader(token, "/api/v0/file/upload_file", signal, 0);
   const fd = new FormData();
   fd.append("file", new Blob([bytes], { type: contentType }), name);
   const r = await fetch(`${BASE}/file/upload_file`, {
     method: "POST",
     signal,
-    headers: { authorization: `Bearer ${token}`, "x-ds-pow-response": pow, ...BROWSER_HEADERS },
+    headers: {
+      authorization: `Bearer ${token}`,
+      "x-ds-pow-response": pow,
+      "x-file-size": String(bytes.length),
+      "x-model-type": modelType,
+      "x-thinking-enabled": thinking ? "1" : "0",
+      ...BROWSER_HEADERS,
+    },
     body: fd,
   });
   const text = await r.text();
   let j = null;
-  try { j = JSON.parse(text); } catch {}
+  try {
+    j = JSON.parse(text);
+  } catch {}
   const id = j?.data?.biz_data?.id;
   if (j?.code !== 0 || !id) {
     if (looksLikeAuthFailure(r.status, text)) throw authError("userToken 已失效，请重新登录");
     throw new Error(`上传文件失败：${text.slice(0, 200)}`);
   }
-  return id;
+  return { id, digest: await sha256Hex(bytes) };
 }
 
+// 轮询解析状态；audit_result 拒绝 / error_code 单独分类
 async function waitFilesReady(token, ids, signal, timeoutMs = 20000) {
   const query = ids.map((i) => `file_ids=${encodeURIComponent(i)}`).join("&");
-  for (let waited = 0; waited < timeoutMs; waited += 2500) {
+  for (let waited = 0; waited < timeoutMs; waited += 2000) {
     if (signal?.aborted) return;
     const r = await fetch(`${BASE}/file/fetch_files?${query}`, { headers: { authorization: `Bearer ${token}`, ...BROWSER_HEADERS }, signal }).catch(() => null);
     const j = await r?.json().catch(() => null);
     const files = j?.data?.biz_data?.files ?? [];
-    const statuses = files.filter((f) => ids.includes(f.id)).map((f) => String(f.status ?? "").toUpperCase());
-    if (statuses.length && statuses.every((s) => s && s !== "PENDING" && s !== "PARSING" && s !== "UPLOADING" && s !== "QUEUED")) return;
-    await new Promise((res) => setTimeout(res, 2500));
+    const mine = files.filter((f) => ids.includes(f.id));
+    if (mine.length) {
+      for (const f of mine) {
+        const audit = String(f.audit_result ?? "").toLowerCase();
+        if (["fail", "reject", "block"].includes(audit)) throw new Error("附件未通过 DeepSeek 内容审核");
+        if (f.error_code) throw new Error(`附件处理失败（error_code=${f.error_code}）`);
+      }
+      const statuses = mine.map((f) => String(f.status ?? "").toUpperCase());
+      if (statuses.length === ids.length && statuses.every((s) => s && s !== "PENDING" && s !== "PARSING" && s !== "UPLOADING" && s !== "QUEUED")) return;
+    }
+    await sleep(2000);
   }
-  // 超时不阻塞：参考实现 5 秒后即接受 PENDING 文件
+  // 超时不阻塞：上游通常 2-3 秒完成，个别大文件稍后也能引用
+}
+
+// 图片/附件 digest 缓存：同账号下相同内容不重复上传（上游实测 file-id 可跨会话引用）
+const fileCache = new Map(); // token → Map<digest, fileId>
+const FILE_CACHE_MAX = 64;
+
+function cacheFileId(token, digest, fileId) {
+  let m = fileCache.get(token);
+  if (!m) {
+    m = new Map();
+    fileCache.set(token, m);
+  }
+  m.set(digest, fileId);
+  while (m.size > FILE_CACHE_MAX) {
+    m.delete(m.keys().next().value);
+  }
 }
 
 function jsonError(status, message, signIn) {
@@ -119,36 +219,47 @@ function jsonError(status, message, signIn) {
   return new Response(JSON.stringify({ error: { message, type: "deepseek_web_error" } }), { status, headers });
 }
 
-// DeepSeek 有些失败用 HTTP 200 + JSON 业务码返回，也有些直接 401
-function looksLikeAuthFailure(status, text) {
-  if (status === 401) return true;
-  return /\b40100\b|\b40101\b|\b40003\b|INVALID_TOKEN|unauthorized|token.{0,12}(invalid|expired|无效|过期)/i.test(text.slice(0, 500));
+// ---- 会话复用缓存（增量提示）----
+// 每账号最多保留 4 个会话（LRU）；新请求的 record 是缓存 record 的延伸 → 只发增量尾部；
+// 完全相同 → 客户端重试，原样重发；发散（编辑历史/别的对话）→ 新建会话。
+// 注意：复用意味着上游会话不再"用完即删"（TTL 30 分钟，可用 sessionReuse: false 关闭）。
+const sessionCache = new Map(); // token → Entry[]（最多 4）
+const SESSION_CACHE_MAX = 4;
+
+function cacheEvictOldest(token, keepSessions) {
+  const arr = sessionCache.get(token);
+  if (!arr || arr.length < SESSION_CACHE_MAX) return;
+  const old = arr.pop();
+  if (!keepSessions) deleteSession(token, old.sessionId);
 }
 
-// 上游偶发 200 + 空事件流（无任何分片就 close）。当作成功会让网关只报
-// "completed response with no content"，这里统一转成显式错误。
-const EMPTY_RESPONSE_MSG = "DeepSeek 返回了空回答（可能触发风控、上下文超限或服务端瞬时异常），请重试或换模型";
+function cachePut(token, entry, keepSessions) {
+  let arr = sessionCache.get(token) ?? [];
+  const idx = arr.findIndex((e) => e.key === entry.key);
+  if (idx >= 0) arr.splice(idx, 1);
+  cacheEvictOldest(token, keepSessions);
+  arr.unshift(entry);
+  sessionCache.set(token, arr);
+}
 
-// 风控画像：网页版浏览器都带这些头，裸 fetch（无 UA）在持续高强度调用下更容易被限流盯上
-const BROWSER_HEADERS = {
-  "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-  origin: "https://chat.deepseek.com",
-  referer: "https://chat.deepseek.com/",
-  "x-client-platform": "web",
-};
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function cacheInvalidate(token, sessionId) {
+  const arr = sessionCache.get(token);
+  if (!arr) return;
+  const rest = arr.filter((e) => e.sessionId !== sessionId);
+  if (rest.length) sessionCache.set(token, rest);
+  else sessionCache.delete(token);
+}
 
 // 单次尝试：把上游 SSE 增量转成 OpenAI chunk（流式输出 SSE 行数组，非流式累积成对象）。
-// enableTools 时从正文流里提取 <tool_call> 块转成 tool_calls（见 lib.mjs 的 ToolCallStream）。
-// 空流重试由外层驱动：每次尝试用全新会话，重试对客户端不可见（流式首块已先行发送）。
-function makeAttempt({ id, created, modelName, wantStream, includeUsage, enableTools }) {
+// enableTools 时用 StreamSieve 从正文流里筛出调用块（DSML / <tool_call> 都认）。
+// 空流/限流的分类与重试由外层驱动；重试对客户端不可见（流式首块仅角色元数据）。
+function makeAttempt({ id, created, modelName, wantStream, includeUsage, enableTools, toolNames }) {
   const tr = new SseTranslator();
-  const tc = enableTools ? new ToolCallStream() : null;
+  const sieve = enableTools ? new StreamSieve({ toolNames }) : null;
   const acc = wantStream ? null : { content: "", reasoning: "" };
-  const emittedCalls = []; // { id, name, arguments }
+  const emittedCalls = [];
   let callIndex = 0;
-  let emittedAny = false; // 是否产出过任何正文/思考/调用，用于识别上游空流
+  let emittedAny = false;
 
   const chunkWith = (delta, finishReason = null, extra = {}) => ({
     id,
@@ -176,38 +287,47 @@ function makeAttempt({ id, created, modelName, wantStream, includeUsage, enableT
     }
   }
 
-  // 处理一批增量：流式写入 out，非流式累积
   function absorb(pieces, out) {
     for (const piece of pieces) {
       if (piece.type === "reasoning") {
         if (acc) acc.reasoning += piece.text;
-        else out.push(`data: ${JSON.stringify(chunkWith({ reasoning_content: piece.text }))}\n\n`);
+        else if (piece.text) out.push(`data: ${JSON.stringify(chunkWith({ reasoning_content: piece.text }))}\n\n`);
         if (piece.text) emittedAny = true;
         continue;
       }
-      if (!tc) {
-        if (acc) acc.content += piece.text;
-        else if (piece.text) out.push(`data: ${JSON.stringify(chunkWith({ content: piece.text }))}\n\n`);
-        if (piece.text) emittedAny = true;
+      if (!sieve) {
+        const text = sanitizeLeaked(piece.text);
+        if (acc) acc.content += text;
+        else if (text) out.push(`data: ${JSON.stringify(chunkWith({ content: text }))}\n\n`);
+        if (text) emittedAny = true;
         continue;
       }
-      const { text, calls } = tc.feed(piece.text);
-      if (acc) acc.content += text;
-      else if (text) out.push(`data: ${JSON.stringify(chunkWith({ content: text }))}\n\n`);
-      if (text || calls.length) emittedAny = true;
-      for (const c of calls) emitCall(c, out);
+      for (const ev of sieve.feed(piece.text)) {
+        if (ev.type === "text") {
+          const text = sanitizeLeaked(ev.text);
+          if (acc) acc.content += text;
+          else if (text) out.push(`data: ${JSON.stringify(chunkWith({ content: text }))}\n\n`);
+          if (text) emittedAny = true;
+        } else {
+          for (const c of ev.calls) emitCall(c, out);
+        }
+      }
     }
   }
 
-  // 流收尾：提取残余（消化返回的正文/调用）
   function drain() {
     const out = [];
-    if (!tc) return out;
-    const tail = tc.end();
-    if (tail.text || tail.calls.length) emittedAny = true;
-    if (acc) acc.content += tail.text;
-    else if (tail.text) out.push(`data: ${JSON.stringify(chunkWith({ content: tail.text }))}\n\n`);
-    for (const c of tail.calls) emitCall(c, out);
+    if (!sieve) return out;
+    for (const ev of sieve.flush()) {
+      if (ev.type === "text") {
+        const text = sanitizeLeaked(ev.text);
+        if (acc) acc.content += text;
+        else if (text) out.push(`data: ${JSON.stringify(chunkWith({ content: text }))}\n\n`);
+        if (text) emittedAny = true;
+      } else {
+        for (const c of ev.calls) emitCall(c, out);
+      }
+    }
     return out;
   }
 
@@ -219,8 +339,7 @@ function makeAttempt({ id, created, modelName, wantStream, includeUsage, enableT
         ? { prompt_tokens: 0, completion_tokens: 0, total_tokens: tr.completionTokens }
         : undefined;
     if (!emittedAny) {
-      // 上游 200 + 空事件流（实测偶发：风控/超限/服务端瞬时异常都会这样静默）。
-      // 不能当成功返回，否则网关只会报 "no content"，看不见真正的问题。
+      // 空流：非流式返回 null 让外层重试/报错；流式由外层决定重试或发 error 事件
       if (acc) return null;
       return [
         `data: ${JSON.stringify({ error: { message: EMPTY_RESPONSE_MSG, type: "deepseek_web_error" } })}\n\n`,
@@ -257,7 +376,6 @@ function makeAttempt({ id, created, modelName, wantStream, includeUsage, enableT
     return out;
   }
 
-  // 喂入上游原始字节文本，返回要写进响应流的 SSE 字符串数组（非流式返回 []）
   function feed(text) {
     const out = [];
     absorb(tr.feed(text), out);
@@ -273,7 +391,23 @@ function makeAttempt({ id, created, modelName, wantStream, includeUsage, enableT
     get finished() {
       return tr.finished;
     },
+    get hintError() {
+      return tr.hintError;
+    },
+    get responseMessageId() {
+      return tr.responseMessageId;
+    },
   };
+}
+
+function isRateLimitHint(hint) {
+  if (!hint) return false;
+  return hint.finishReason === "rate_limit_reached" || /频繁/.test(hint.content ?? "");
+}
+
+function hintMessage(hint) {
+  const c = hint?.content ? `：${hint.content}` : "";
+  return `DeepSeek 上游提示错误（${hint?.finishReason ?? "unknown"}）${c}`;
 }
 
 async function handleChatCompletion(init, token, options) {
@@ -292,10 +426,43 @@ async function handleChatCompletion(init, token, options) {
     req.tool_choice !== "none" &&
     Array.isArray(req.tools) &&
     req.tools.some((t) => t?.type === "function" && t.function?.name);
-  const prompt = buildPrompt(messages, enableTools ? req.tools : null);
+  const toolNames = enableTools ? req.tools.map((t) => t.function?.name).filter(Boolean) : [];
   const signal = init?.signal;
+  const keepSessions = options?.keepSessions === true;
+  const reuseEnabled = options?.sessionReuse !== false;
+  const maxContextTokens = Number(options?.maxContextTokens) > 0 ? Number(options?.maxContextTokens) : MAX_CONTEXT_TOKENS;
+  const retryAttempts = Math.max(1, Number(options?.retryAttempts) || 3);
+  const retryBackoffMs = Math.max(0, Number(options?.retryBackoffMs) || 1500);
+  const rateDelays = Array.isArray(options?.rateLimitRetryDelays)
+    ? options.rateLimitRetryDelays.map((n) => Math.max(0, Number(n) || 0))
+    : [5000, 15000];
+  const jitterMs = Math.max(0, Number(options?.jitterMs) || 0);
 
-  // 附件：上传到网页版后用 ref_file_ids 引用；带图片时必须走 vision 模型后端。
+  // 组装 prompt（record 随对话增长；instructions 每轮重发）
+  const parts = buildPromptParts(messages, enableTools ? req.tools : null, {
+    toolChoice: req.tool_choice,
+    maxContextTokens,
+    toolResultLimit: options?.toolResultLimit,
+  });
+  const promptFull = parts.instructions ? (parts.record ? `${parts.record}\n\n${parts.instructions}` : parts.instructions) : parts.record;
+
+  // 会话复用判定：record 延伸 → 增量；相同 → 重试原样重发；发散/超限 → 新会话
+  let reuseEntry = null;
+  let reuseKind = null;
+  if (reuseEnabled && signal?.aborted !== true) {
+    const entries = (sessionCache.get(token) ?? []).filter((e) => Date.now() - e.sentAt < SESSION_TTL_MS);
+    let best = null;
+    for (const e of entries) {
+      if (parts.record === e.record) best = best && best.record.length >= e.record.length ? best : e;
+      else if (parts.record.startsWith(e.record) && (!best || e.record.length > best.record.length)) best = e;
+    }
+    if (best && estimateTokens(parts.record) <= maxContextTokens * 0.95) {
+      reuseEntry = best;
+      reuseKind = parts.record === best.record ? "same" : "delta";
+    }
+  }
+
+  // 附件：上传（digest 去重）→ 轮询解析 → ref_file_ids；带图片走 vision 后端。
   // 上传失败不静默降级——模型看不见图会胡编，显式报错让调用方重试。
   let refFileIds = [];
   let hasImage = false;
@@ -303,8 +470,24 @@ async function handleChatCompletion(init, token, options) {
     const images = extractImages(messages);
     const attachments = extractAttachments(messages);
     hasImage = images.length > 0;
-    for (const f of [...images, ...attachments]) {
-      refFileIds.push(await uploadFile(token, f, signal));
+    const files = [...images, ...attachments];
+    const maxFileBytes = 10 * 1024 * 1024;
+    let totalBytes = 0;
+    for (const f of files) {
+      const { bytes, contentType } = await fetchFileBytes(f, signal, maxFileBytes);
+      totalBytes += bytes.length;
+      if (totalBytes > 32 * 1024 * 1024) throw new Error("附件总大小超过限制（32MiB）");
+      const digest = await sha256Hex(bytes);
+      let fileId = fileCache.get(token)?.get(digest);
+      if (!fileId) {
+        const up = await uploadBytes(token, bytes, contentType, f.name, signal, {
+          modelType: hasImage ? "vision" : "default",
+          thinking: def.thinking,
+        });
+        fileId = up.id;
+        cacheFileId(token, digest, fileId);
+      }
+      refFileIds.push(fileId);
     }
     if (refFileIds.length) await waitFilesReady(token, refFileIds, signal);
   } catch (e) {
@@ -313,39 +496,57 @@ async function handleChatCompletion(init, token, options) {
     return jsonError(502, String(e?.message ?? e));
   }
 
-  // 打开一次 completion 上游：全新会话 + PoW。失败以 err.auth（重新登录）/ err.passthrough
-  // （非 2xx 原样透传给 magpie）区分，其余按普通错误处理。
-  async function openUpstream() {
-    const session = await postJson(token, "/chat_session/create", {}, signal);
-    const sessionId = session.json?.data?.biz_data?.chat_session?.id;
-    if (session.status !== 200 || !sessionId) {
-      if (looksLikeAuthFailure(session.status, session.text)) throw authError("DeepSeek 拒绝了这个 userToken，请重新登录");
-      throw new Error(`创建 DeepSeek 会话失败：HTTP ${session.status} ${session.text.slice(0, 200)}`);
+  // 打开一次 completion 上游。plan.reused 时复用缓存会话（不新建）。
+  // 失败以 err.auth（重新登录）/ err.passthrough（非 2xx 透传）区分。
+  const reuseParentId = reuseEntry?.parentMessageId ?? null;
+  const attemptPrompt = (attempt) => {
+    if (attempt === 1 && reuseKind === "delta" && reuseEntry) {
+      const tail = parts.record.slice(reuseEntry.record.length).replace(/^\n+/, "");
+      return parts.instructions ? `${tail}\n\n${parts.instructions}` : tail;
     }
-    const keep = options?.keepSessions === true;
-    const cleanup = () => {
-      if (keep !== true) deleteSession(token, sessionId);
+    return promptFull; // fresh / retry-same / 重试一律完整 prompt（新会话没有父链历史）
+  };
+  async function openUpstream(attempt) {
+    const reused = attempt === 1 && !!reuseEntry;
+    let sessionId = reused ? reuseEntry.sessionId : null;
+    if (!sessionId) {
+      const session = await postJson(token, "/chat_session/create", {}, signal);
+      sessionId = session.json?.data?.biz_data?.chat_session?.id;
+      if (session.status !== 200 || !sessionId) {
+        if (looksLikeAuthFailure(session.status, session.text)) throw authError("DeepSeek 拒绝了这个 userToken，请重新登录");
+        throw new Error(`创建 DeepSeek 会话失败：HTTP ${session.status} ${session.text.slice(0, 200)}`);
+      }
+    }
+    const discard = () => {
+      if (reused) cacheInvalidate(token, sessionId);
+      if (!keepSessions) deleteSession(token, sessionId);
     };
     try {
-      const header = await getPowHeader(token, "/api/v0/chat/completion", signal);
+      const header = await getPowHeader(token, "/api/v0/chat/completion", signal, jitterMs);
+      const body = {
+        chat_session_id: sessionId,
+        parent_message_id: reused ? reuseParentId : null,
+        model_type: hasImage ? "vision" : "default",
+        prompt: attemptPrompt(attempt),
+        ref_file_ids: refFileIds,
+        thinking_enabled: def.thinking,
+        search_enabled: def.search === true || options?.search === true,
+        action: null,
+        preempt: false,
+      };
+      if (typeof req.temperature === "number") body.temperature = req.temperature;
+      if (typeof req.top_p === "number") body.top_p = req.top_p;
+      if (typeof req.max_tokens === "number") body.max_tokens = req.max_tokens;
       const upstream = await fetch(`${BASE}/chat/completion`, {
         method: "POST",
         signal,
         headers: { "content-type": "application/json", authorization: `Bearer ${token}`, "x-ds-pow-response": header, ...BROWSER_HEADERS },
-        body: JSON.stringify({
-          chat_session_id: sessionId,
-          parent_message_id: null,
-          model_type: hasImage ? "vision" : "default",
-          prompt,
-          ref_file_ids: refFileIds,
-          thinking_enabled: def.thinking,
-          search_enabled: options?.search === true,
-          action: null,
-          preempt: false,
-        }),
+        body: JSON.stringify(body),
       });
       if (!upstream.ok) {
-        cleanup();
+        discard();
+        const waf = wafKind(upstream);
+        if (waf) throw new Error(`DeepSeek WAF 挑战（${waf}），该出口 IP 被风控，请稍后重试或更换网络`);
         if (upstream.status === 401) throw authError("DeepSeek 拒绝了这个 userToken，请重新登录");
         // 其余非 2xx 原样透传，magpie 会按厂商回答处理限流与故障切换
         throw Object.assign(new Error(`upstream ${upstream.status}`), {
@@ -355,90 +556,170 @@ async function handleChatCompletion(init, token, options) {
       const ct = upstream.headers.get("content-type") ?? "";
       if (!ct.includes("text/event-stream")) {
         const text = await upstream.text();
-        cleanup();
+        discard();
         if (looksLikeAuthFailure(200, text)) throw authError("DeepSeek 拒绝了这个 userToken，请重新登录");
+        if (looksLikeMute(text)) {
+          const until = /"muted?_until"\s*:\s*(\d+)/.exec(text)?.[1];
+          throw muteError(`DeepSeek 账号被禁言${until ? `（至 ${new Date(Number(until) * 1000).toLocaleString()}）` : ""}，请换账号或稍后再试`);
+        }
         throw new Error(`DeepSeek 返回了异常回答：${text.slice(0, 400)}`);
       }
-      return { upstream, cleanup };
+      return {
+        upstream,
+        finish: (ok, responseMessageId) => {
+          if (ok && reuseEnabled) {
+            cachePut(
+              token,
+              {
+                key: `${parts.record.length}:${parts.record.slice(0, 256)}`,
+                record: parts.record,
+                sessionId,
+                parentMessageId: responseMessageId ?? null,
+                sentAt: Date.now(),
+              },
+              keepSessions,
+            );
+          } else if (!ok) {
+            discard();
+          } else if (!keepSessions) {
+            deleteSession(token, sessionId); // 不复用：保持"用完即删"
+          }
+        },
+      };
     } catch (e) {
-      cleanup(); // 幂等：重复删除会话无害
+      if (!(e?.passthrough || e?.auth || e?.mute)) discard();
       throw e;
     }
   }
 
   const dec = new TextDecoder();
-  const retryAttempts = Math.max(1, Number(options?.retryAttempts) || 3);
-  const retryBackoffMs = Math.max(0, Number(options?.retryBackoffMs) || 1500);
-  // 把打开失败转成对外的 Response；流式重试中途失败无法再改状态码，走 error 事件
-  const openOrFail = async () => {
+  const isResponse = (x) => x instanceof Response;
+  // 打开失败转成对外 Response；流式重试中途失败无法改状态码，走 error 事件
+  async function openOrFail(attempt) {
     try {
-      return await openUpstream();
+      return await openUpstream(attempt);
     } catch (e) {
       if (e?.passthrough) return e.passthrough;
       if (e?.auth) return jsonError(401, e.message, "expired");
+      if (e?.mute) return jsonError(429, e.message);
       if (signal?.aborted) throw e;
       return jsonError(502, String(e?.message ?? e));
     }
-  };
-  const isResponse = (x) => x instanceof Response;
+  }
+  // 分类一次尝试的结果：返回 { kind: "ok"|"rateLimit"|"empty", hint }
+  function classify(at) {
+    const hint = at.hintError;
+    if (hint && isRateLimitHint(hint)) return { kind: "rateLimit", hint };
+    if (!at.emittedAny) return { kind: "empty", hint };
+    return { kind: "ok", hint };
+  }
 
   // 首次尝试先于响应承诺打开：错误能按原语义返回
-  let opened = await openOrFail();
+  let opened = await openOrFail(1);
   if (isResponse(opened)) return opened;
+  let currentDiscard = () => opened.finish(false);
 
   if (!wantStream) {
-    // 非流式：整段读完；空流则换新会话退避重试
-    for (let attempt = 1; ; attempt++) {
-      const at = makeAttempt({ id: "chatcmpl-" + crypto.randomUUID().replaceAll("-", "").slice(0, 24), created: Math.floor(Date.now() / 1000), modelName, wantStream: false, includeUsage, enableTools });
+    // 非流式：整段读完；限流退避重试、空流换会话重试
+    let attempt = 1;
+    let rateIdx = 0;
+    let emptyCount = 0;
+    for (;;) {
+      const at = makeAttempt({ id: "chatcmpl-" + crypto.randomUUID().replaceAll("-", "").slice(0, 24), created: Math.floor(Date.now() / 1000), modelName, wantStream: false, includeUsage, enableTools, toolNames });
       const reader = opened.upstream.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         at.feed(dec.decode(value, { stream: true }));
       }
-      opened.cleanup();
-      const final = at.finalize();
-      if (final !== null || attempt >= retryAttempts || signal?.aborted) {
-        if (final === null) return jsonError(502, EMPTY_RESPONSE_MSG);
+      const verdict = classify(at);
+      if (verdict.kind === "ok") {
+        opened.finish(true, at.responseMessageId);
+        const final = at.finalize();
         return new Response(JSON.stringify(final), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       }
-      await sleep(retryBackoffMs * attempt);
-      opened = await openOrFail();
+      opened.finish(false);
+      const hint = verdict.hint;
+      if (verdict.kind === "rateLimit" && rateIdx < rateDelays.length) {
+        await sleep(rateDelays[rateIdx++]);
+        attempt++;
+      } else if (verdict.kind === "empty" && emptyCount < Math.max(0, retryAttempts - 1) && !hint) {
+        emptyCount++;
+        await sleep(retryBackoffMs * emptyCount);
+        attempt++;
+      } else if (hint && verdict.kind === "empty") {
+        // 空 + hint（非限流）：上游明确拒绝，重试无意义
+        return jsonError(502, hintMessage(hint));
+      } else {
+        return jsonError(502, verdict.kind === "rateLimit" ? "DeepSeek 上游限流（消息发送过于频繁），已自动重试仍被拒，请稍后再试或增加账号" : EMPTY_RESPONSE_MSG);
+      }
+      opened = await openOrFail(attempt);
       if (isResponse(opened)) return opened;
     }
   }
 
-  // 流式：空流时在流内换新会话重试——首块只有角色元数据，重试对客户端不可见
+  // 流式：空流/限流在流内换新会话重试——首块只有角色元数据，重试对客户端不可见。
+  // finished 后继续把上游读到尾（排干），避免污染 keep-alive 连接产生后续空响应。
   const id = "chatcmpl-" + crypto.randomUUID().replaceAll("-", "").slice(0, 24);
   const created = Math.floor(Date.now() / 1000);
-  let currentCleanup = opened.cleanup;
   const body = new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
       const push = (s) => controller.enqueue(enc.encode(s));
       try {
         push(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: modelName, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
-        for (let attempt = 1; ; attempt++) {
-          const at = makeAttempt({ id, created, modelName, wantStream: true, includeUsage, enableTools });
+        let attempt = 1;
+        let rateIdx = 0;
+        let emptyCount = 0;
+        for (;;) {
+          const at = makeAttempt({ id, created, modelName, wantStream: true, includeUsage, enableTools, toolNames });
           const reader = opened.upstream.body.getReader();
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            for (const s of at.feed(dec.decode(value, { stream: true }))) push(s);
-            if (at.finished) break;
+            if (!at.finished) {
+              for (const s of at.feed(dec.decode(value, { stream: true }))) push(s);
+            }
+            // finished 后只排干不再转写
           }
-          opened.cleanup();
-          currentCleanup = null;
-          if (!at.emittedAny && attempt < retryAttempts && !signal?.aborted) {
-            await sleep(retryBackoffMs * attempt);
-            opened = await openUpstream();
-            currentCleanup = opened.cleanup;
+          const verdict = classify(at);
+          if (verdict.kind === "ok") {
+            opened.finish(true, at.responseMessageId);
+            for (const s of at.finalize()) push(s);
+            break;
+          }
+          opened.finish(false);
+          const hint = verdict.hint;
+          const canRetry =
+            !signal?.aborted &&
+            (verdict.kind === "rateLimit"
+              ? rateIdx < rateDelays.length
+              : verdict.kind === "empty"
+                ? emptyCount < Math.max(0, retryAttempts - 1) && !hint
+                : false);
+          if (canRetry) {
+            if (verdict.kind === "rateLimit") await sleep(rateDelays[rateIdx++]);
+            else {
+              emptyCount++;
+              await sleep(retryBackoffMs * emptyCount);
+            }
+            attempt++;
+            opened = await openUpstream(attempt);
+            currentDiscard = () => opened.finish(false);
             continue;
           }
-          for (const s of at.finalize()) push(s);
+          // 终态：发明确的 error 事件（SDK 能看到真实原因）
+          const message =
+            verdict.kind === "rateLimit"
+              ? "DeepSeek 上游限流（消息发送过于频繁），已自动重试仍被拒，请稍后再试或增加账号"
+              : hint
+                ? hintMessage(hint)
+                : EMPTY_RESPONSE_MSG;
+          push(`data: ${JSON.stringify({ error: { message, type: "deepseek_web_error" } })}\n\n`);
+          push("data: [DONE]\n\n");
           break;
         }
         controller.close();
@@ -453,7 +734,7 @@ async function handleChatCompletion(init, token, options) {
       }
     },
     cancel() {
-      currentCleanup?.();
+      currentDiscard?.();
     },
   });
   return new Response(body, {
@@ -474,9 +755,10 @@ export const DeepSeekWebPlugin = async (_input, options) => ({
           id,
           {
             name: m.name,
-            limit: { context: 131072, output: 8192 },
-            reasoning: m.reasoning,
-            tool_call: true, // 文本协议桥接：插件把工具定义写进 prompt 并解析 <tool_call> 块
+            // 网页版实测输入上限 2621440 字符 ≈ 1M token（client/settings?scope=model）
+            limit: { context: 1000000, output: 65536 },
+            reasoning: m.thinking,
+            tool_call: true, // DSML 文本协议桥接：插件把工具定义写进 prompt 并筛分调用块
             modalities: { input: ["text"] },
             cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
             free: true,
@@ -488,7 +770,7 @@ export const DeepSeekWebPlugin = async (_input, options) => ({
 
   auth: {
     provider: PROVIDER,
-    maxConcurrency: 3,
+    maxConcurrency: 2, // 并发过高会触发账号禁言（web2api 同款默认）
     methods: [
       {
         type: "api",
@@ -497,10 +779,17 @@ export const DeepSeekWebPlugin = async (_input, options) => ({
       },
     ],
     async authorize(inputs) {
-      const key = (typeof inputs === "string" ? inputs : inputs?.key ?? inputs?.value ?? "").trim();
+      // 容错粘贴：裸 token / "Bearer " 前缀 / localStorage 的 {"value":…} 包裹 / 引号
+      let key = (typeof inputs === "string" ? inputs : inputs?.key ?? inputs?.value ?? "").trim();
+      if (key.startsWith("Bearer ")) key = key.slice(7).trim();
+      try {
+        const j = JSON.parse(key);
+        if (j && typeof j.value === "string") key = j.value.trim();
+      } catch {}
+      key = key.replace(/^"+|"+$/g, "").trim();
       if (!key) return { type: "failed", error: "请粘贴 userToken" };
       try {
-        const r = await fetch(`${BASE}/users/current`, { headers: { authorization: `Bearer ${key}` } });
+        const r = await fetch(`${BASE}/users/current`, { headers: { authorization: `Bearer ${key}`, ...BROWSER_HEADERS } });
         if (r.status === 401) return { type: "failed", error: "userToken 无效或已过期" };
         if (!r.ok) return { type: "failed", error: `DeepSeek 返回 HTTP ${r.status}` };
         const j = await r.json();
@@ -517,7 +806,7 @@ export const DeepSeekWebPlugin = async (_input, options) => ({
       const auth = await getAuth();
       if (auth?.type !== "api" || !auth.key) return { windows: [] };
       try {
-        const r = await fetch(`${BASE}/users/current`, { headers: { authorization: `Bearer ${auth.key}` } });
+        const r = await fetch(`${BASE}/users/current`, { headers: { authorization: `Bearer ${auth.key}`, ...BROWSER_HEADERS } });
         if (r.status === 401) return { error: "userToken 已失效，请重新登录", signIn: "expired", windows: [] };
         if (!r.ok) return { error: `DeepSeek 返回 HTTP ${r.status}`, windows: [] };
         const j = await r.json();

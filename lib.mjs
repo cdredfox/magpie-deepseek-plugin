@@ -1,4 +1,8 @@
-// 纯函数部分：messages 拍平成网页版 prompt、DeepSeek SSE → OpenAI chunk 转换。
+// 纯函数部分：messages 拍平（含 DSML 工具协议与上下文裁剪）、
+// DeepSeek SSE → OpenAI chunk 转换（含 hint/toast/ready 事件）、流式工具调用筛分。
+//
+// 工具协议采用 DSML（<|DSML|invoke ...><![CDATA[…]]>，与 DeepSeek 原生特殊 token 同风格），
+// 同时兼容旧的 <tool_call> JSON 块——参考 freeapi / web2api 两个逆向项目的实现。
 
 function contentToText(content) {
   if (typeof content === "string") return content;
@@ -13,7 +17,7 @@ function contentToText(content) {
   return parts.join("");
 }
 
-// 提取 messages 里的图片，供上传到网页版（VISION）后用 ref_file_ids 引用。
+// 提取 messages 里的图片，供上传到网页版后用 ref_file_ids 引用。
 // 支持 data URL（base64 直传）与 http(s) URL（请求时下载）。
 // 返回 [{ mime, base64?, url?, name }]；identical data URL 去重，上限 maxImages。
 export function extractImages(messages, maxImages = 8) {
@@ -71,31 +75,442 @@ export function extractAttachments(messages, maxFiles = 8) {
   return out;
 }
 
-// 把一条历史里的工具调用渲染成协议块（和模型被要求输出的格式完全一致，方便模仿）
-function callToProtocol(c) {
-  const name = c.function?.name ?? "?";
-  let raw = c.function?.arguments ?? "{}";
-  if (typeof raw === "string") {
-    try {
-      raw = JSON.stringify(JSON.parse(raw));
-    } catch {}
-  } else {
-    try {
-      raw = JSON.stringify(raw ?? {});
-    } catch {
-      raw = "{}";
-    }
-  }
-  return `<tool_call>\n{"name": ${JSON.stringify(name)}, "arguments": ${raw}}\n</tool_call>`;
+// ---- token 估算（保守：CJK 每字 1 token，其余每 4 字符 1 token，空白不计）----
+const CJK_RE = /[\u3000-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF]/g;
+export function estimateTokens(text) {
+  if (!text) return 0;
+  const cjk = (text.match(CJK_RE) ?? []).length;
+  const other = text.replace(CJK_RE, "").replace(/\s/g, "").length;
+  return cjk + Math.max(other > 0 ? 1 : 0, Math.ceil(other / 4));
 }
 
-// 把 OpenAI chat completions 的 messages 拍平成 DeepSeek 网页版的单条 prompt。
-// 网页版接口没有 system 槽位、也吃不到完整历史（服务端会话不归我们管），
-// 多轮对话按转写文本的方式塞进同一条 prompt。
-// 带 tools 时进入工具模式：附上工具定义与调用协议（<tool_call> 块），
-// 插件随后从回答流里解析这些块转成 OpenAI tool_calls。
-export function buildPrompt(messages, tools) {
-  const hasTools = Array.isArray(tools) && tools.some((t) => t?.type === "function" && t.function?.name);
+// ---- 泄漏清理：模型偶尔吐出原生特殊 token / 残留协议标签 / 引用标记 ----
+const LEAK_RE =
+  /<\/?\s*[|｜]*\s*(?:dsml\s*[|｜]*)*(?:tool_calls|tool_call|calls|invoke|parameter)\b[^>]{0,120}>|<\s*[|｜]\s*[a-zA-Z0-9▁_]{1,40}\s*[|｜]\s*>|\[citation:\d+\]/g;
+export function sanitizeLeaked(text) {
+  if (!text) return text;
+  return text.replace(LEAK_RE, "");
+}
+
+// ---- DSML 工具协议 ----
+//
+// 模板格式（参考 ds2api / freeapi / web2api）：
+//   <|DSML|tool_calls>
+//     <|DSML|invoke name="工具名">
+//       <|DSML|parameter name="参数名"><![CDATA[值]]></|DSML|parameter>
+//     </|DSML|invoke>
+//   </|DSML|tool_calls>
+// 字符串值包 CDATA（引号/换行/代码零转义）；数字/布尔/null 纯文本。
+// 分隔符 | 与全宽 ｜、大小写、重复管道都容忍。
+
+function cdataEscape(s) {
+  return String(s).replaceAll("]]>", "]]]]><![CDATA[>");
+}
+
+function xmlAttr(s) {
+  return String(s).replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function htmlUnescape(s) {
+  return String(s)
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&#39;", "'")
+    .replaceAll("&amp;", "&")
+    .replaceAll(/<br\s*\/?>/gi, "\n");
+}
+
+// 历史里 assistant 的 tool_calls 回写成 DSML 块（模型上轮见过自己输出格式的自洽性）
+export function formatToolCallsForPrompt(toolCalls) {
+  const invokes = (toolCalls ?? []).map((c) => {
+    const name = c.function?.name ?? "?";
+    let obj = {};
+    const raw = c.function?.arguments ?? "{}";
+    try {
+      obj = typeof raw === "string" ? JSON.parse(raw || "{}") : raw ?? {};
+    } catch {
+      obj = {};
+    }
+    if (obj === null || typeof obj !== "object" || Array.isArray(obj)) obj = { value: obj };
+    const params = Object.entries(obj)
+      .map(([k, v]) => {
+        // DSML 规则：字符串值必须 CDATA 包裹；数字/布尔/null 纯文本
+        const val = typeof v === "string" ? `<![CDATA[${cdataEscape(v)}]]>` : v === undefined ? "null" : JSON.stringify(v);
+        return `    <|DSML|parameter name="${xmlAttr(k)}">${val}</|DSML|parameter>`;
+      })
+      .join("\n");
+    return `  <|DSML|invoke name="${xmlAttr(name)}">\n${params ? params + "\n" : ""}  </|DSML|invoke>`;
+  });
+  return `<|DSML|tool_calls>\n${invokes.join("\n")}\n</|DSML|tool_calls>`;
+}
+
+// 工具协议说明（注入 prompt 末尾；规则放最后指令遵循最强）
+export function buildToolInstructions(tools, toolChoice) {
+  const list = (tools ?? []).filter((t) => t?.type === "function" && t.function?.name);
+  if (!list.length) return "";
+  let extra = "";
+  if (toolChoice === "required") extra = "本轮必须至少调用一个工具，不要直接给最终答复。";
+  else if (toolChoice && typeof toolChoice === "object" && toolChoice?.function?.name)
+    extra = `本轮必须调用工具 ${toolChoice.function.name}，不要调用其他工具，不要直接回答。`;
+  else if (typeof toolChoice === "string" && !["auto", "none"].includes(toolChoice))
+    extra = `本轮必须调用工具 ${toolChoice}，不要调用其他工具，不要直接回答。`;
+
+  const toolLines = list
+    .map((t) => {
+      const desc = (t.function.description ?? "").trim();
+      return `  - ${t.function.name}${desc ? `：${desc}` : ""}`;
+    })
+    .join("\n");
+
+  return [
+    "[可用工具]",
+    "需要调用工具时，原样输出下面的调用块（第一行必须是 <|DSML|tool_calls>，不要放进代码块，前后不要附加任何解释文字；字符串参数一律用 CDATA 包裹）：",
+    "",
+    "<|DSML|tool_calls>",
+    '  <|DSML|invoke name="工具名">',
+    '    <|DSML|parameter name="参数名"><![CDATA[参数值]]></|DSML|parameter>',
+    "  </|DSML|invoke>",
+    "</|DSML|tool_calls>",
+    "",
+    "规则：",
+    "- 工具名写在 invoke 的 name 属性；每个参数一个 parameter 节点，参数名写在 name 属性。",
+    "- 字符串值必须用 <![CDATA[...]]> 包裹；数字、布尔、null 直接写纯文本。",
+    '- 可以在同一个 <|DSML|tool_calls> 块里连续写多个 <|DSML|invoke>；调用块输出完必须立即停笔。',
+    "- 严禁编造工具的返回结果：不要替“用户”写任何消息，不要自己写出“[工具…的返回结果]”，不要假装已经看到结果。真实结果由系统在下一轮附进对话记录。",
+    "- 不需要调用工具时，直接写给用户看的答复正文，不要输出调用块。不要复述对话记录。",
+    extra,
+    "",
+    "可用工具：",
+    toolLines,
+  ]
+    .filter((l) => l !== undefined)
+    .join("\n");
+}
+
+// ---- 工具调用块的流式筛分（StreamSieve）----
+//
+// 从正文流里实时剥出调用块（DSML 与旧 <tool_call> JSON 都认），容忍：
+//   - 任意分包（含逐字符）：未完成的 "<|"/"|DS" 等前缀从最早可能处扣住
+//   - markdown 围栏包裹、前后空白行
+//   - 连续多个块、块间夹正文（suffix 迭代处理，不递归）
+//   - 缓冲 1MiB 硬上限：超限强制按正文放行，防对抗性输出卡死
+// 解析失败降级为正文，永不静默丢内容。
+
+const START_CANDIDATES = [
+  "<|dsml|tool_calls>",
+  "<|dsml|invoke",
+  "|dsml|tool_calls>",
+  "|dsml|invoke",
+  "<tool_calls>",
+  "<tool_call>",
+  "<invoke",
+  "<calls>",
+];
+const MAX_TAG_LEN = Math.max(...START_CANDIDATES.map((t) => t.length));
+const SIEVE_CAP = 1024 * 1024;
+
+// 在缓冲里找最早的完整开标签（DSML 标记或普通 wrapper），返回 { index, kind } 或 null
+function findStart(text) {
+  const dsmlRe = /(?:<|(?<![|｜<]))[|｜]+\s*dsml\s*[|｜]+\s*(?:tool_calls|invoke)\b/gi;
+  let best = -1;
+  const consider = (i) => {
+    if (i >= 0 && (best < 0 || i < best)) best = i;
+  };
+  let m = dsmlRe.exec(text);
+  if (m) consider(m.index);
+  const lower = text.toLowerCase();
+  for (const t of ["<tool_calls>", "<tool_call>", "<calls>", "<invoke "]) {
+    const i = lower.indexOf(t);
+    if (i >= 0) consider(i);
+  }
+  // "<invoke>" 无空格变体
+  const iv = lower.indexOf("<invoke>");
+  if (iv >= 0) consider(iv);
+  return best;
+}
+
+// 正文侧扣住策略：尾部如果可能是任何候选开标签的前缀（从最早的 '<'/'｜' 起），就扣住不发
+function holdIndex(text) {
+  if (text.length < 2) {
+    // 单字符：'<' 或管道都可能是前缀
+    return /[<|｜]/.test(text) ? 0 : -1;
+  }
+  const from = Math.max(0, text.length - MAX_TAG_LEN);
+  const lower = text.toLowerCase();
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i];
+    if (ch !== "<" && ch !== "|" && ch !== "｜") continue;
+    const tail = lower.slice(i);
+    if (tail.length >= MAX_TAG_LEN) continue;
+    for (const c of START_CANDIDATES) {
+      if (c.startsWith(tail)) return i;
+    }
+  }
+  return -1;
+}
+
+// 找捕获区里第一个完整块的结束偏移（CDATA 当单个 token，防止值里的字面标签截断结构）。
+// 注意 ">" 必须显式匹配：可选的 ">" 会把未写完的闭合标签提前当成完整块。
+function blockEnd(buf) {
+  const re = /<\/?\s*[|｜]*\s*(?:dsml\s*[|｜]+\s*)?(?:tool_calls|tool_call|calls|invoke)\b[^>]*>|<!\[CDATA\[[\s\S]*?(?:\]\]>|$)/gi;
+  let m;
+  let openKind = null;
+  while ((m = re.exec(buf))) {
+    const tok = m[0];
+    if (tok.startsWith("<!")) continue; // CDATA 原子跳过
+    const lower = tok.toLowerCase();
+    const isClose = lower.startsWith("</");
+    const kind = /tool_calls|tool_call|calls|invoke/.exec(lower)?.[0] ?? "";
+    const norm = kind === "tool_call" || kind === "calls" ? "tool_calls" : kind;
+    if (!openKind) {
+      if (!isClose && (norm === "tool_calls" || norm === "invoke")) openKind = norm;
+      continue;
+    }
+    if (isClose && norm === openKind) return m.index + m[0].length;
+  }
+  return -1;
+}
+
+function repairLooseJson(s) {
+  let out = s.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)(\s*:)/g, '$1"$2"$3');
+  out = out.replace(/,(\s*[}\]])/g, "$1");
+  out = out.replace(/\\(?![\\/"bfnrtu])/g, "\\\\");
+  return out;
+}
+
+const CDATA_STRING_KEYS = new Set([
+  "content", "file_content", "text", "prompt", "query", "command", "cmd", "script", "code",
+  "old_string", "new_string", "pattern", "path", "file_path", "result", "input", "value",
+  "data", "message", "body", "output", "description", "url",
+]);
+
+function attrVal(attrs, name) {
+  const m = new RegExp(`${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i").exec(attrs);
+  return m ? (m[1] ?? m[2]) : null;
+}
+
+function resolveToolName(name, toolNames) {
+  if (!name || !toolNames?.length) return name;
+  if (toolNames.includes(name)) return name;
+  const lower = name.toLowerCase();
+  const hit = toolNames.find((t) => t.toLowerCase() === lower);
+  if (hit) return hit;
+  const snake = name.replace(/(?<=[a-z0-9])([A-Z])/g, "_$1").toLowerCase();
+  return toolNames.includes(snake) ? snake : name;
+}
+
+function processParamValue(name, raw) {
+  let v = raw.trim();
+  let cdata = false;
+  if (v.startsWith("<![CDATA[")) {
+    const end = v.lastIndexOf("]]>");
+    if (end >= 9) {
+      v = v.slice(9, end);
+      cdata = true;
+    }
+  }
+  const t = v.trim();
+  const key = (name ?? "").toLowerCase();
+  if (cdata && CDATA_STRING_KEYS.has(key)) return htmlUnescape(v);
+  if (/^(true|false)$/i.test(t)) return /^true/i.test(t);
+  if (/^null$/i.test(t)) return null;
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  if (t.startsWith("{") || t.startsWith("[")) {
+    try {
+      return JSON.parse(t);
+    } catch {}
+    const rep = repairLooseJson(t);
+    if (rep !== null) {
+      try {
+        return JSON.parse(rep);
+      } catch {}
+    }
+  }
+  return htmlUnescape(v);
+}
+
+// 解析一个完整调用块（DSML 优先，回退旧 <tool_call> JSON）
+function parseToolBlock(block, toolNames, loose = false) {
+  if (loose) {
+    const openC = (block.match(/<!\[CDATA\[/g) ?? []).length;
+    const closeC = (block.match(/\]\]>/g) ?? []).length;
+    if (openC > closeC) block += "]]>";
+  }
+  const hasOpenWrapper = /<\s*[|｜]*\s*(?:dsml\s*[|｜]+\s*)?(?:tool_calls|tool_call|calls)\s*>/i.test(block);
+  const hasInvoke = /<\s*[|｜]*\s*(?:dsml\s*[|｜]+\s*)?invoke\b/i.test(block);
+  if (!hasOpenWrapper && hasInvoke) block = "<|DSML|tool_calls>\n" + block;
+
+  const calls = [];
+  // 每次调用新建正则（/g 的 lastIndex 会在多次 parseToolBlock 间泄漏）
+  const bodyPat = '((?:<!\\[CDATA\\[[\\s\\S]*?\\]\\]>|(?!<\\s*/\\s*[|｜]*\\s*(?:dsml\\s*[|｜]+\\s*)?(?:tool_calls|tool_call|calls|invoke))[\\s\\S])*?)';
+  const invokeRe = new RegExp(
+    `<\\s*[|｜]*\\s*(?:dsml\\s*[|｜]+\\s*)?invoke\\s*([^>]*?)>${bodyPat}<\\s*/\\s*[|｜]*\\s*(?:dsml\\s*[|｜]+\\s*)?invoke\\s*>`,
+    "gi",
+  );
+  let im;
+  while ((im = invokeRe.exec(block))) {
+    const name = attrVal(im[1] ?? "", "name") ?? "?";
+    const args = {};
+    const paramRe = new RegExp(
+      `<\\s*[|｜]*\\s*(?:dsml\\s*[|｜]+\\s*)?parameter\\s*([^>]*?)>${bodyPat}<\\s*/\\s*[|｜]*\\s*(?:dsml\\s*[|｜]+\\s*)?parameter\\s*>`,
+      "gi",
+    );
+    let pm;
+    while ((pm = paramRe.exec(im[2]))) {
+      const key = attrVal(pm[1] ?? "", "name") ?? "参数";
+      const val = processParamValue(key, pm[2]);
+      if (key in args) {
+        args[key] = Array.isArray(args[key]) ? [...args[key], val] : [args[key], val];
+      } else {
+        args[key] = val;
+      }
+    }
+    calls.push({
+      name: resolveToolName(name, toolNames),
+      arguments: JSON.stringify(args, (_k, v) => (v === undefined ? null : v)),
+    });
+  }
+  if (calls.length) return calls;
+
+  // 旧协议：<tool_call>{"name","arguments"}</tool_call>
+  const legacy = /<tool_call>([\s\S]*?)<\/tool_call>/i.exec(block) ?? /<tool_calls>([\s\S]*?)<\/tool_calls>/i.exec(block);
+  if (legacy) {
+    let obj = null;
+    const inner = legacy[1].trim();
+    try {
+      obj = JSON.parse(inner);
+    } catch {}
+    if (!obj) {
+      const rep = repairLooseJson(inner);
+      if (rep !== null) {
+        try {
+          obj = JSON.parse(rep);
+        } catch {}
+      }
+    }
+    if (obj && typeof obj === "object") {
+      const arr = Array.isArray(obj) ? obj : [obj];
+      for (const o of arr) {
+        if (!o || typeof o.name !== "string" || !o.name) continue;
+        let args = o.arguments ?? {};
+        if (typeof args !== "string") {
+          try {
+            args = JSON.stringify(args);
+          } catch {
+            args = "{}";
+          }
+        }
+        calls.push({ name: resolveToolName(o.name, toolNames), arguments: args });
+      }
+    }
+  }
+  return calls;
+}
+
+export class StreamSieve {
+  constructor({ toolNames = [], maxBuffer = SIEVE_CAP } = {}) {
+    this.toolNames = toolNames;
+    this.max = Math.max(1024, maxBuffer);
+    this.pending = "";
+    this.capture = null; // { buf }
+  }
+
+  // 喂入正文增量，返回 [{ type: "text", text } | { type: "calls", calls }]
+  feed(text) {
+    const events = [];
+    let buf = this.pending + text;
+    this.pending = "";
+    for (;;) {
+      if (this.capture) {
+        this.capture.buf += buf; // 新数据并入捕获区
+        buf = "";
+        const end = blockEnd(this.capture.buf);
+        if (end >= 0) {
+          const block = this.capture.buf.slice(0, end);
+          const suffix = this.capture.buf.slice(end);
+          this.capture = null;
+          const calls = parseToolBlock(block, this.toolNames);
+          if (calls.length) events.push({ type: "calls", calls });
+          else events.push({ type: "text", text: block });
+          buf = suffix;
+          continue;
+        }
+        if (this.capture.buf.length > this.max) {
+          events.push({ type: "text", text: this.capture.buf });
+          this.capture = null;
+          continue;
+        }
+        break; // 块未闭合，等更多数据
+      }
+      const idx = findStart(buf);
+      if (idx < 0) {
+        const hold = holdIndex(buf);
+        if (hold >= 0) {
+          if (hold > 0) events.push({ type: "text", text: buf.slice(0, hold) });
+          this.pending = buf.slice(hold);
+        } else {
+          events.push({ type: "text", text: buf });
+        }
+        buf = "";
+        break;
+      }
+      if (idx > 0) events.push({ type: "text", text: buf.slice(0, idx) });
+      this.capture = { buf: buf.slice(idx) };
+      buf = "";
+    }
+    return events;
+  }
+
+  // 流结束：未闭合的捕获区尝试宽松解析，失败当正文
+  flush() {
+    const events = [];
+    if (this.capture) {
+      const calls = parseToolBlock(this.capture.buf, this.toolNames, true);
+      events.push(calls.length ? { type: "calls", calls } : { type: "text", text: this.capture.buf });
+      this.capture = null;
+    }
+    if (this.pending) {
+      events.push({ type: "text", text: this.pending });
+      this.pending = "";
+    }
+    return events;
+  }
+}
+
+// ---- prompt 组装 ----
+//
+// buildPromptParts 把拍平结果拆成 record（随对话增长的前缀）与 instructions（每轮重发的规则），
+// 会话复用时只发 record 的增量尾部 + instructions（见 index.mjs 的会话缓存）。
+
+// 超预算裁剪：从最老的轮次开始丢，保护最后一条用户/工具消息及其之后的所有轮次
+function pruneTurns(turns, budgetTokens) {
+  if (!budgetTokens || budgetTokens <= 0) return turns;
+  const join = (list) => list.map((t) => `${t.role}：${t.text ?? ""}`).join("\n");
+  let list = turns;
+  let guard = list.length + 1;
+  while (guard-- > 0) {
+    const total = estimateTokens(join(list));
+    if (total <= budgetTokens) break;
+    let lastProt = -1;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].kind === "user" || list[i].kind === "tool") {
+        lastProt = i;
+        break;
+      }
+    }
+    if (lastProt <= 0) break; // 没有可丢的
+    list = list.slice(1);
+  }
+  return list;
+}
+
+// 把 OpenAI chat completions 的 messages 拍平成网页版的 record + instructions 两段。
+// 带 tools 时进入工具模式（DSML 协议），插件从回答流里筛出调用块转成 OpenAI tool_calls。
+export function buildPromptParts(messages, tools, opts = {}) {
+  const toolList = (Array.isArray(tools) ? tools : []).filter((t) => t?.type === "function" && t.function?.name);
+  const hasTools = toolList.length > 0;
 
   // tool 消息常常只有 tool_call_id 没有 name，先建 id → 工具名 的映射
   const callNames = new Map();
@@ -107,6 +522,7 @@ export function buildPrompt(messages, tools) {
     }
   }
 
+  const toolLimit = Number(opts.toolResultLimit) > 0 ? Number(opts.toolResultLimit) : 0;
   const systems = [];
   const turns = [];
   for (const m of messages ?? []) {
@@ -117,113 +533,78 @@ export function buildPrompt(messages, tools) {
       let t = text;
       if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
         const rendered = hasTools
-          ? m.tool_calls.map(callToProtocol).join("\n")
+          ? formatToolCallsForPrompt(m.tool_calls)
           : `[助手${m.tool_calls.map((c) => `调用工具 ${c.function?.name ?? "?"}(${c.function?.arguments ?? ""})`).join("；")}]`;
         t = (t ? t + "\n" : "") + rendered;
       }
       turns.push({ role: "助手", text: t, kind: "assistant" });
     } else if (m.role === "tool") {
       const name = callNames.get(m.tool_call_id) ?? m.name ?? "工具";
-      turns.push({ role: "用户", text: `[工具 ${name} 的返回结果]\n${text}`, kind: "tool" });
+      const body = toolLimit && text.length > toolLimit ? text.slice(0, toolLimit) + "\n…（截断）" : text;
+      turns.push({ role: "用户", text: `[工具 ${name} 的返回结果]\n${body}`, kind: "tool" });
     } else {
       turns.push({ role: "用户", text, kind: "user" });
     }
   }
   const sysText = systems.join("\n\n");
 
-  if (!hasTools) {
-    if (turns.length === 1 && turns[0].role === "用户") {
-      return sysText ? `${sysText}\n\n${turns[0].text}` : turns[0].text;
+  const renderRecord = (turnList) => {
+    // 仅"无系统提示的单条用户消息"走直发；其余统一包装格式——
+    // 保证同一对话每轮的 record 前缀一致，会话复用才能从第二轮开始发增量
+    if (!sysText && !hasTools && turnList.length === 1 && turnList[0].role === "用户") {
+      return turnList[0].text;
     }
-    const lastIsUser = turns[turns.length - 1]?.role === "用户";
     const lines = [];
     if (sysText) lines.push(`[系统设定]\n${sysText}\n`);
     lines.push("[对话记录]");
-    for (const t of turns) lines.push(`${t.role}：${t.text ?? ""}`);
-    lines.push("");
-    lines.push(
-      lastIsUser
-        ? "请以助手的身份，直接回复上面对话记录中最后一条用户消息。不要复述记录本身。"
-        : "请以助手的身份，直接接着上面最后一条助手消息继续说。不要复述记录本身。",
-    );
+    for (const t of turnList) lines.push(`${t.role}：${t.text ?? ""}`);
     return lines.join("\n");
-  }
+  };
 
-  // 工具模式：记录 + 工具定义 + 回复规则（规则放最后，指令遵循最强）
-  const toolDefs = tools
-    .filter((t) => t?.type === "function" && t.function?.name)
-    .map((t) => {
-      const f = t.function;
-      const schema = f.parameters ? JSON.stringify(f.parameters) : "";
-      return `### ${f.name}\n${(f.description ?? "").trim()}${schema ? `\n参数 JSON Schema：${schema}` : ""}`;
-    })
-    .join("\n\n");
+  let kept = pruneTurns(turns, Number(opts.maxContextTokens) > 0 ? Number(opts.maxContextTokens) : 900000);
+  const record = renderRecord(kept);
+  const last = kept[kept.length - 1];
 
-  const last = turns[turns.length - 1];
-  const lines = [];
-  if (sysText) lines.push(`[系统设定]\n${sysText}\n`);
-  lines.push("[对话记录]");
-  for (const t of turns) lines.push(`${t.role}：${t.text ?? ""}`);
-  lines.push("");
-  lines.push("[可用工具]");
-  lines.push(toolDefs);
-  lines.push("");
-  lines.push("[回复规则]");
-  lines.push("你是上面对话记录里的助手本人，正在借助工具替用户完成任务。请从对话记录中断的地方继续：");
-  lines.push(
-    last?.kind === "tool"
-      ? "最后一条是工具返回结果。根据它决定下一步：要么调用下一个工具，要么给出给用户看的最终答复。"
-      : last?.kind === "user"
-        ? "请处理最后一条用户消息：需要动手就调用工具，能直接回答就直接回答。"
-        : "接着最后的进度继续完成任务。",
-  );
-  lines.push("需要调用工具时，原样输出下面的调用块（不要放进代码块，前后不要附加解释文字）：");
-  lines.push('<tool_call>\n{"name": "工具名", "arguments": {…符合该工具定义的参数…}}\n</tool_call>');
-  lines.push("可以一次连续输出多个调用块；调用块输出完必须立即停笔。");
-  lines.push(
-    "严禁编造工具的返回结果：不要替“用户”写任何消息，不要自己写出“[工具…的返回结果]”，不要假装已经看到结果。真实结果由系统在下一轮附进对话记录。",
-  );
-  lines.push("不需要调用工具时，直接写给用户看的答复正文，不要输出调用块。不要复述对话记录。");
-  return lines.join("\n");
-}
-
-// 把上游字节流按行喂给 DeepSeekStreamParser，容许任意分包。
-export class SseTranslator {
-  constructor() {
-    this.parser = new DeepSeekStreamParser();
-    this.buf = "";
-  }
-
-  // 喂入任意一段原始文本，返回 [{ type: "content"|"reasoning", text }]
-  feed(text) {
-    let buf = this.buf + text;
-    const out = [];
-    let idx;
-    while ((idx = buf.indexOf("\n")) !== -1) {
-      const line = buf.slice(0, idx).replace(/\r$/, "");
-      buf = buf.slice(idx + 1);
-      out.push(...this.parser.feed(line));
-      if (this.parser.finished) break;
+  let instructions;
+  if (!hasTools) {
+    if (kept.length === 1 && kept[0].role === "用户") {
+      instructions = "";
+    } else {
+      const lastIsUser = last?.role === "用户";
+      instructions = lastIsUser
+        ? "请以助手的身份，直接回复上面对话记录中最后一条用户消息。不要复述记录本身。"
+        : "请以助手的身份，直接接着上面最后一条助手消息继续说。不要复述记录本身。";
     }
-    this.buf = buf;
-    return out;
+  } else {
+    const rules = [
+      "[回复规则]",
+      "你是上面对话记录里的助手本人，正在借助工具替用户完成任务。请从对话记录中断的地方继续：",
+      last?.kind === "tool"
+        ? "最后一条是工具返回结果。根据它决定下一步：要么调用下一个工具，要么给出给用户看的最终答复。"
+        : last?.kind === "user"
+          ? "请处理最后一条用户消息：需要动手就调用工具，能直接回答就直接回答。"
+          : "接着最后的进度继续完成任务。",
+    ];
+    const toolInstr = buildToolInstructions(toolList, opts.toolChoice);
+    instructions = `${toolInstr}\n\n${rules.join("\n")}`;
   }
-
-  get finished() {
-    return this.parser.finished;
-  }
-
-  get completionTokens() {
-    return this.parser.completionTokens;
-  }
+  return { record, instructions };
 }
-//   event: ready|update_session|title|close
-//   data: {"v": "增量文本"}                                  —— 追加到当前分片
-//   data: {"v": {"response": {...fragments: [...]}}}          —— 消息头，含初始分片
-//   data: {"p": "response/fragments", "o": "APPEND", "v": [...]} —— 新分片（THINK / RESPONSE）
-//   data: {"p": "response/fragments/-1/content", "o": "APPEND", "v": "..."} —— 追加
-//   data: {"p": "response", "o": "BATCH", "v": [...]}         —— 批量，含 token 用量
-// THINK 分片 → reasoning_content，RESPONSE 分片 → content。
+
+export function buildPrompt(messages, tools, opts) {
+  const { record, instructions } = buildPromptParts(messages, tools, opts);
+  return instructions ? (record ? `${record}\n\n${instructions}` : instructions) : record;
+}
+
+// ---- SSE 解析 ----
+//
+// 网页版事件流（实测 2026-10）：
+//   event: ready   data: {"response_message_id": 123, ...}        —— 多轮父链 id
+//   event: hint    data: {"type":"error","finish_reason":"rate_limit_reached","content":"…频繁…"}
+//   event: toast   data: {"type":"error", ...}                     —— 上游拒绝（如客户端过旧）
+//   event: update_session|title|close
+//   data: {"v": "增量文本"} / {"v": {"response": {...}}} / {"p":…,"o":"APPEND","v":…}
+// THINK 分片 → reasoning，RESPONSE 分片 → content。
 export class DeepSeekStreamParser {
   constructor() {
     this.event = null;
@@ -231,9 +612,10 @@ export class DeepSeekStreamParser {
     this.curType = null;
     this.finished = false;
     this.completionTokens = null;
+    this.responseMessageId = null; // event: ready 帧里的多轮父链 id
+    this.hintError = null; // { content, finishReason } —— hint/toast 的 type=error
   }
 
-  // 喂入一行原始文本（不含换行），返回 [{ type: "content"|"reasoning", text }]
   feed(line) {
     const out = [];
     if (!line) {
@@ -249,20 +631,36 @@ export class DeepSeekStreamParser {
       this.dataLines.push(line.slice(5).replace(/^ /, ""));
       return out;
     }
-    // 其他行原样忽略
     return out;
   }
 
   flushEvent() {
     const out = [];
+    let data = null;
     if (this.dataLines.length) {
       const raw = this.dataLines.join("\n");
       this.dataLines = [];
       try {
-        out.push(...this.handleData(JSON.parse(raw)));
+        data = JSON.parse(raw);
+        out.push(...this.handleData(data));
       } catch {
         // 非 JSON 的 data 行（如 [DONE]）忽略
       }
+    }
+    if (this.event === "ready" && data && typeof data.response_message_id === "number") {
+      this.responseMessageId = data.response_message_id;
+    }
+    if (
+      (this.event === "hint" || this.event === "toast") &&
+      data &&
+      typeof data === "object" &&
+      String(data.type ?? "").toLowerCase() === "error"
+    ) {
+      this.hintError = {
+        event: this.event,
+        content: String(data.content ?? data.msg ?? ""),
+        finishReason: String(data.finish_reason ?? (this.event === "toast" ? "toast_error" : "hint_error")),
+      };
     }
     if (this.event === "close") this.finished = true;
     this.event = null;
@@ -324,190 +722,39 @@ export class DeepSeekStreamParser {
   }
 }
 
-// ---- 工具调用提取 ----
-//
-// 网页版模型只能吐文本，插件约定它用 <tool_call>…</tool_call> 块表达工具调用
-// （见 buildPrompt 的回复规则），这个类从内容流里实时把块剥出来：
-//   - 其余文本原样通过（正文增量）
-//   - 每个块解析成 { name, arguments }（arguments 归一化为 JSON 字符串，OpenAI 格式）
-//   - 容忍任意分包：未完整的 "<tool_call>" 前缀会扣住不发
-//   - 容忍模型把块包进 ``` 围栏：紧贴块前的纯围栏行会被剥掉
-//   - JSON 解析失败时把原文当正文放行，不吞内容
-const CALL_OPEN = "<tool_call>";
-const CALL_CLOSE = "</tool_call>";
-
-function callHoldbackLen(s) {
-  const max = Math.min(s.length, CALL_OPEN.length - 1);
-  for (let n = max; n > 0; n--) {
-    if (CALL_OPEN.startsWith(s.slice(s.length - n))) return n;
-  }
-  return 0;
-}
-
-// 判断一行（不含换行）是不是纯围栏行。"```xm" 这种没写完的也算（等下一批定性）。
-function isFenceLine(line) {
-  return /^[ \t]*`{1,3}[a-zA-Z0-9_-]*[ \t]*$/.test(line);
-}
-
-// 剥掉紧贴调用块的围栏行：从尾部往回删完整的围栏行（含换行），
-// 最后再剥掉紧贴 OPEN 的围栏片段（如 "```xml<tool_call>" 连写在同一行）。
-function stripTrailingFenceLines(s) {
-  let end = s.length;
-  for (;;) {
-    if (end === 0 || s[end - 1] !== "\n") break;
-    const nl = s.lastIndexOf("\n", end - 2);
-    if (!isFenceLine(s.slice(nl + 1, end - 1))) break;
-    end = nl + 1;
-  }
-  if (end > 0 && s[end - 1] !== "\n") {
-    const nl = s.lastIndexOf("\n", end - 1);
-    if (isFenceLine(s.slice(nl + 1, end))) end = nl + 1;
-  }
-  return s.slice(0, end);
-}
-
-export class ToolCallStream {
+export class SseTranslator {
   constructor() {
+    this.parser = new DeepSeekStreamParser();
     this.buf = "";
-    this.inside = false;
-    this.ended = false;
-    this.afterClose = false; // 刚消费完一个调用块，先消化后面的空白行/包栏围栏行
   }
 
   feed(text) {
-    this.buf += text;
-    const out = { text: "", calls: [] };
-    for (;;) {
-      if (this.inside) {
-        const end = this.buf.indexOf(CALL_CLOSE);
-        if (end === -1) break; // 块没闭合，等更多数据
-        this.addCall(this.buf.slice(0, end), out, true);
-        this.buf = this.buf.slice(end + CALL_CLOSE.length);
-        this.inside = false;
-        this.afterClose = true;
-        continue;
-      }
-      if (this.afterClose) {
-        // 逐行消化调用块后面的空白行和包调用的裸/xml/json 围栏行，
-        // 碰到第一行正经内容就交回正常流程。行没收尾前先扣住（等定性）。
-        // 必须在找下一个 OPEN 之前做，否则"围栏 + 紧跟下一个调用"时围栏会被当成正文放行。
-        let waiting = false;
-        for (;;) {
-          const nl = this.buf.indexOf("\n");
-          const complete = nl !== -1;
-          const line = complete ? this.buf.slice(0, nl) : this.buf;
-          if (/^[ \t]*$/.test(line)) {
-            if (!complete) {
-              waiting = true;
-              break;
-            }
-            this.buf = this.buf.slice(nl + 1); // 空白行：跳过
-            continue;
-          }
-          if (isFenceLine(line)) {
-            if (!complete) {
-              waiting = true;
-              break;
-            }
-            if (/^[ \t]*```(?:xml|json)?[ \t]*$/.test(line)) {
-              this.buf = this.buf.slice(nl + 1); // 包调用的围栏行：丢弃
-              continue;
-            }
-            this.afterClose = false; // 带语言标注的围栏是正经代码块，保留
-            break;
-          }
-          this.afterClose = false; // 正经内容
-          break;
-        }
-        if (waiting) break;
-      }
-      const idx = this.buf.indexOf(CALL_OPEN);
-      if (idx !== -1) {
-        out.text += stripTrailingFenceLines(this.buf.slice(0, idx));
-        this.buf = this.buf.slice(idx + CALL_OPEN.length);
-        this.inside = true;
-        this.afterClose = false;
-        continue;
-      }
-      // 没有完整 OPEN：只放行能唯一判定的部分，其余扣住——
-      //   a) 尾部 "<tool_call>" 的前缀（连同紧贴的围栏行）
-      //   b) 尾部连续的纯围栏行（完整与否都要等下一行才能定性）
-      let p = this.buf.length - callHoldbackLen(this.buf);
-      if (p < this.buf.length) {
-        for (;;) {
-          if (p === 0) break;
-          if (this.buf[p - 1] === "\n") {
-            const nl = this.buf.lastIndexOf("\n", p - 2);
-            if (!isFenceLine(this.buf.slice(nl + 1, p - 1))) break;
-            p = nl + 1;
-            continue;
-          }
-          const nl = this.buf.lastIndexOf("\n", p - 1);
-          if (!isFenceLine(this.buf.slice(nl + 1, p))) break;
-          p = nl + 1;
-          continue;
-        }
-      } else if (this.buf.length) {
-        let end = this.buf.length;
-        for (;;) {
-          if (end === 0) break;
-          if (this.buf[end - 1] === "\n") {
-            const nl = this.buf.lastIndexOf("\n", end - 2);
-            if (!isFenceLine(this.buf.slice(nl + 1, end - 1))) break;
-            end = nl + 1;
-            continue;
-          }
-          const nl = this.buf.lastIndexOf("\n", end - 1);
-          if (!isFenceLine(this.buf.slice(nl + 1, end))) break;
-          end = nl + 1;
-          continue;
-        }
-        p = Math.min(p, end);
-      }
-      if (p > 0) {
-        out.text += this.buf.slice(0, p);
-        this.buf = this.buf.slice(p);
-      }
-      break;
+    let buf = this.buf + text;
+    const out = [];
+    let idx;
+    while ((idx = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, idx).replace(/\r$/, "");
+      buf = buf.slice(idx + 1);
+      out.push(...this.parser.feed(line));
+      if (this.parser.finished) break;
     }
+    this.buf = buf;
     return out;
   }
 
-  // 流结束：把残余处理掉（幂等）
-  end() {
-    if (this.ended) return { text: "", calls: [] };
-    this.ended = true;
-    const out = { text: "", calls: [] };
-    if (this.inside) {
-      // 没等到闭合标签：试着按 JSON 抢救，失败则原文放行
-      this.addCall(this.buf, out, false);
-      this.buf = "";
-      this.inside = false;
-    } else {
-      out.text += this.buf;
-      this.buf = "";
-    }
-    return out;
+  get finished() {
+    return this.parser.finished;
   }
 
-  // withClose：解析失败回放原文时是否补回闭合标签（流中途的块有，抢救残块没有）
-  addCall(raw, out, withClose) {
-    let obj = null;
-    try {
-      obj = JSON.parse(raw.trim());
-    } catch {}
-    if (obj && typeof obj === "object" && typeof obj.name === "string" && obj.name) {
-      let args = obj.arguments ?? {};
-      if (typeof args !== "string") {
-        try {
-          args = JSON.stringify(args);
-        } catch {
-          args = "{}";
-        }
-      }
-      out.calls.push({ name: obj.name, arguments: args });
-    } else {
-      out.text += CALL_OPEN + raw + (withClose ? CALL_CLOSE : "");
-    }
+  get completionTokens() {
+    return this.parser.completionTokens;
+  }
+
+  get responseMessageId() {
+    return this.parser.responseMessageId;
+  }
+
+  get hintError() {
+    return this.parser.hintError;
   }
 }
