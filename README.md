@@ -69,6 +69,8 @@ token 等同于你的账号登录凭据，只保存在本机 magpie 的 `plugin-
 ## 限制
 
 - **工具调用是桥接的，不是原生的**：模型偶尔会输出不合协议的调用块（该次调用降级为正文），复杂智能体任务的成功率低于原生工具调用模型，跑偏时重试通常即可。
+- **偶发空回答**：上游偶尔会返回 200 + 空事件流（实测与内容无关，疑似服务端瞬时异常），插件会转成显式错误（非流式 502 / 流式 error 事件）而不是静默成功，magpie 可见原因并重试或故障切换。
+- **用量是近似值**：网页版只提供会话累计 token（`accumulated_token_usage`），拆不出输入/输出，插件只填 `usage.total_tokens`，`prompt_tokens`/`completion_tokens` 记 0。
 - **不支持图片输入**：消息里的图片会被替换成占位说明。
 - **上下文**：按 128K 声明（网页版单条输入上限 260 万字符，足够宽松，但超长对话被拍平后效果受模型本身上下文约束）。
 - **速率**：受 DeepSeek 网页版自身的频率限制，每个账号并发默认 3（`magpie.maxConcurrency`），被限流时 magpie 会按厂商回答做故障切换。
@@ -93,5 +95,6 @@ token 等同于你的账号登录凭据，只保存在本机 magpie 的 `plugin-
 | `lib.mjs` | 纯函数：messages 拍平（含工具协议）、SSE 事件流 → OpenAI chunk 转换、`<tool_call>` 流式提取 |
 | `pow.mjs` | PoW 求解器（加载并调用官方 wasm） |
 | `sha3_wasm_bg.wasm` | DeepSeek 网页版自带的 sha3 wasm（`fe-static.deepseek.com` 原样拷贝） |
+| `test.mjs` | 单元测试（bun test.mjs）：拍平、协议提取、SSE 转写、空回答与鉴权映射 |
 
 测试过的环境：magpie 0.1.2283（插件宿主 Bun 1.4.4）、`magpie provider test`、沙箱网关 `magpie web --gateway` 的流式/非流式/多轮/深度思考请求，以及工具调用两轮往返（发起调用 → 回填结果 → 最终答复）。

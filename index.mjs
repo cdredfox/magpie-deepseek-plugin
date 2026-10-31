@@ -57,8 +57,12 @@ function jsonError(status, message, signIn) {
 // DeepSeek 有些失败用 HTTP 200 + JSON 业务码返回，也有些直接 401
 function looksLikeAuthFailure(status, text) {
   if (status === 401) return true;
-  return /\b40100\b|\b40101\b|unauthorized|token.{0,12}(invalid|expired|无效|过期)/i.test(text.slice(0, 500));
+  return /\b40100\b|\b40101\b|\b40003\b|INVALID_TOKEN|unauthorized|token.{0,12}(invalid|expired|无效|过期)/i.test(text.slice(0, 500));
 }
+
+// 上游偶发 200 + 空事件流（无任何分片就 close）。当作成功会让网关只报
+// "completed response with no content"，这里统一转成显式错误。
+const EMPTY_RESPONSE_MSG = "DeepSeek 返回了空回答（可能触发风控、上下文超限或服务端瞬时异常），请重试或换模型";
 
 // 把 completion 的 SSE 转成 OpenAI chat completions 的回答。
 // enableTools 时从正文流里提取 <tool_call> 块转成 tool_calls（见 lib.mjs 的 ToolCallStream）。
@@ -71,6 +75,7 @@ function translateCompletion(upstream, { modelName, wantStream, includeUsage, to
   const acc = wantStream ? null : { content: "", reasoning: "" };
   const emittedCalls = []; // { id, name, arguments }
   let callIndex = 0;
+  let emittedAny = false; // 是否产出过任何正文/思考/调用，用于识别上游空流
 
   const chunkWith = (delta, finishReason = null, extra = {}) => ({
     id,
@@ -84,6 +89,7 @@ function translateCompletion(upstream, { modelName, wantStream, includeUsage, to
   function emitCall(call, sink) {
     const cid = "call_" + crypto.randomUUID().replaceAll("-", "").slice(0, 24);
     emittedCalls.push({ id: cid, name: call.name, arguments: call.arguments });
+    emittedAny = true;
     if (!acc && sink) {
       sink(
         chunkWith({
@@ -101,16 +107,19 @@ function translateCompletion(upstream, { modelName, wantStream, includeUsage, to
       if (piece.type === "reasoning") {
         if (acc) acc.reasoning += piece.text;
         else sink(chunkWith({ reasoning_content: piece.text }));
+        if (piece.text) emittedAny = true;
         continue;
       }
       if (!tc) {
         if (acc) acc.content += piece.text;
         else sink(chunkWith({ content: piece.text }));
+        if (piece.text) emittedAny = true;
         continue;
       }
       const { text, calls } = tc.feed(piece.text);
       if (acc) acc.content += text;
       else if (text) sink(chunkWith({ content: text }));
+      if (text || calls.length) emittedAny = true;
       for (const c of calls) emitCall(c, sink);
     }
   }
@@ -121,15 +130,26 @@ function translateCompletion(upstream, { modelName, wantStream, includeUsage, to
     const tail = tc.end();
     if (acc) acc.content += tail.text;
     else if (tail.text && sink) sink(chunkWith({ content: tail.text }));
+    if (tail.text || tail.calls.length) emittedAny = true;
     for (const c of tail.calls) emitCall(c, sink);
   }
 
   function finalize() {
     drainTail(null);
+    // 网页版只给会话累计用量（accumulated_token_usage），拆不出输入/输出，只放进 total_tokens
     const usage =
       tr.completionTokens != null
-        ? { prompt_tokens: 0, completion_tokens: tr.completionTokens, total_tokens: tr.completionTokens }
+        ? { prompt_tokens: 0, completion_tokens: 0, total_tokens: tr.completionTokens }
         : undefined;
+    if (!emittedAny) {
+      // 上游 200 + 空事件流（实测偶发：风控/超限/服务端瞬时异常都会这样静默）。
+      // 不能当成功返回，否则网关只会报 "no content"，看不见真正的问题。
+      if (acc) return null;
+      return [
+        `data: ${JSON.stringify({ error: { message: EMPTY_RESPONSE_MSG, type: "deepseek_web_error" } })}\n\n`,
+        "data: [DONE]\n\n",
+      ].join("");
+    }
     if (acc) {
       const message = { role: "assistant", content: acc.content || null };
       if (acc.reasoning) message.reasoning_content = acc.reasoning;
@@ -297,13 +317,18 @@ async function handleChatCompletion(init, token, options) {
       });
     }
     // 非流式：读完后组装一个完整回答
+    const dec = new TextDecoder();
     const reader = upstream.body.getReader();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       t.feed(dec.decode(value, { stream: true }));
     }
-    return new Response(JSON.stringify(t.finalize()), {
+    const final = t.finalize();
+    if (final === null) {
+      return jsonError(502, EMPTY_RESPONSE_MSG);
+    }
+    return new Response(JSON.stringify(final), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
