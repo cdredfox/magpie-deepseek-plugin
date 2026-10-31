@@ -1,0 +1,14 @@
+{
+  "name": "magpie-deepseek-web",
+  "version": "0.1.0",
+  "description": "把 DeepSeek 网页版（chat.deepseek.com）代理成 magpie 供应商，通过 API 调用网页版模型",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": ["index.mjs", "lib.mjs", "pow.mjs", "sha3_wasm_bg.wasm", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "deepseek"],
+  "license": "MIT",
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiM0RDZCRkUiLz48dGV4dCB4PSIzMiIgeT0iNDQiIGZvbnQtZmFtaWx5PSJIZWx2ZXRpY2EsIEFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXNpemU9IjM2IiBmb250LXdlaWdodD0iYm9sZCIgZmlsbD0iI2ZmZiIgdGV4dC1hbmNob3I9Im1pZGRsZSI+RDwvdGV4dD48L3N2Zz4=",
+    "maxConcurrency": 3
+  }
+}
