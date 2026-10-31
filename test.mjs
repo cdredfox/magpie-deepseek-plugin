@@ -1,7 +1,7 @@
 // 单元测试：bun test.mjs（或 node --experimental-vm-modules，推荐 bun）
 // 覆盖：messages 拍平、<tool_call> 流式提取、SSE 转写、空回答显式报错、业务码鉴权映射。
 import assert from "node:assert/strict";
-import { buildPrompt, SseTranslator, ToolCallStream } from "./lib.mjs";
+import { buildPrompt, SseTranslator, ToolCallStream, extractImages, extractAttachments } from "./lib.mjs";
 import { DeepSeekWebPlugin } from "./index.mjs";
 
 let passed = 0;
@@ -50,7 +50,44 @@ ok("图片内容替换为占位说明", () => {
     [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,xx" } }, { type: "text", text: "图里是啥" }] }],
     null,
   );
-  assert.ok(p.includes("网页版暂不支持") && p.includes("图里是啥"));
+  assert.ok(p.includes("[图片 #1]") && p.includes("图里是啥"));
+});
+
+// ---------- 图片/附件提取 ----------
+console.log("extractImages / extractAttachments");
+ok("data URL 提取 mime 与 base64", () => {
+  const imgs = extractImages([{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,QUJD" } }] }]);
+  assert.equal(imgs.length, 1);
+  assert.equal(imgs[0].mime, "image/jpeg");
+  assert.equal(imgs[0].base64, "QUJD");
+  assert.equal(imgs[0].name, "image-1.jpg");
+});
+ok("http URL 提取 url 字段", () => {
+  const imgs = extractImages([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://a.com/x.png" } }] }]);
+  assert.equal(imgs.length, 1);
+  assert.equal(imgs[0].url, "https://a.com/x.png");
+  assert.equal(imgs[0].base64, undefined);
+});
+ok("type:image 与 image_url 等价、跨消息累计编号", () => {
+  const imgs = extractImages([
+    { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AA" } }] },
+    { role: "user", content: [{ type: "image", image: "https://a.com/y.png" }] },
+  ]);
+  assert.equal(imgs.length, 2);
+  assert.equal(imgs[1].name, "image-2.png");
+});
+ok("相同 data URL 去重、超过上限截断", () => {
+  const dup = [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }] }];
+  assert.equal(extractImages([...dup, ...dup]).length, 1);
+  const many = Array.from({ length: 10 }, (_, i) => ({ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${i}` } }] }));
+  assert.equal(extractImages(many).length, 8);
+});
+ok("file part 提取附件", () => {
+  const fs = extractAttachments([{ role: "user", content: [{ type: "file", filename: "notes.txt", file_data: "data:text/plain;base64,SGk=" }] }]);
+  assert.equal(fs.length, 1);
+  assert.equal(fs[0].mime, "text/plain");
+  assert.equal(fs[0].name, "notes.txt");
+  assert.equal(fs[0].base64, "SGk=");
 });
 
 // ---------- 工具模式 ----------

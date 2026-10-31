@@ -4,12 +4,71 @@ function contentToText(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const parts = [];
+  let imgIdx = 0;
   for (const p of content) {
     if (p?.type === "text" && p.text) parts.push(p.text);
-    else if (p?.type === "image" || p?.type === "image_url") parts.push("[图片（网页版暂不支持）]");
+    else if (p?.type === "image" || p?.type === "image_url") parts.push(`[图片 #${++imgIdx}]`);
     else if (typeof p?.text === "string") parts.push(p.text);
   }
   return parts.join("");
+}
+
+// 提取 messages 里的图片，供上传到网页版（VISION）后用 ref_file_ids 引用。
+// 支持 data URL（base64 直传）与 http(s) URL（请求时下载）。
+// 返回 [{ mime, base64?, url?, name }]；identical data URL 去重，上限 maxImages。
+export function extractImages(messages, maxImages = 8) {
+  const seen = new Set();
+  const out = [];
+  for (const m of messages ?? []) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const p of m.content) {
+      if (p?.type !== "image" && p?.type !== "image_url") continue;
+      const url = p?.image_url?.url ?? p?.url ?? (typeof p?.image === "string" ? p.image : null);
+      if (!url || typeof url !== "string") continue;
+      let item = null;
+      const dm = /^data:([^;,]+);base64,(.+)$/s.exec(url);
+      if (dm) {
+        item = { mime: dm[1], base64: dm[2] };
+      } else if (/^https?:\/\//.test(url)) {
+        item = { mime: null, url };
+      }
+      if (!item) continue;
+      const key = item.base64 ? `b:${item.base64.slice(0, 4096)}:${item.base64.length}` : `u:${url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      item.name = `image-${out.length + 1}.${extFor(item.mime)}`;
+      out.push(item);
+      if (out.length >= maxImages) return out;
+    }
+  }
+  return out;
+}
+
+function extFor(mime) {
+  const map = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
+  return map[mime ?? ""] ?? "png";
+}
+
+// 提取非图片附件（约定 content part：{ type: "file", filename?, file_data: "data:mime;base64,…" }）。
+// OpenAI chat completions 没有标准的文件 part，这是插件扩展；纯文本内容照旧走 prompt。
+export function extractAttachments(messages, maxFiles = 8) {
+  const out = [];
+  for (const m of messages ?? []) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const p of m.content) {
+      if (p?.type !== "file") continue;
+      const dm = /^data:([^;,]+);base64,(.+)$/s.exec(typeof p?.file_data === "string" ? p.file_data : "");
+      if (!dm) continue;
+      const mime = dm[1];
+      out.push({
+        mime,
+        base64: dm[2],
+        name: (typeof p?.filename === "string" && p.filename) || `file-${out.length + 1}.${extFor(mime)}`,
+      });
+      if (out.length >= maxFiles) return out;
+    }
+  }
+  return out;
 }
 
 // 把一条历史里的工具调用渲染成协议块（和模型被要求输出的格式完全一致，方便模仿）

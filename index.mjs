@@ -11,7 +11,7 @@
 // 本插件负责转成网页版格式、再把它的事件流补丁转回 OpenAI chunk。
 
 import { powResponseHeader } from "./pow.mjs";
-import { buildPrompt, SseTranslator, ToolCallStream } from "./lib.mjs";
+import { buildPrompt, SseTranslator, ToolCallStream, extractImages, extractAttachments } from "./lib.mjs";
 
 const PROVIDER = "deepseek-web";
 const BASE = "https://chat.deepseek.com/api/v0";
@@ -46,6 +46,71 @@ async function deleteSession(token, sessionId) {
   try {
     await postJson(token, "/chat_session/delete", { chat_session_ids: [sessionId] });
   } catch {}
+}
+
+// ---- 文件上传（图片走 VISION 通道）----
+// 实测协议（2026-10）：
+//   create_pow_challenge(target_path=/api/v0/file/upload_file) → PoW
+//   POST /file/upload_file（multipart，字段 file）→ { id, model_kind: "VISION", status: "PENDING" }
+//   GET  /file/fetch_files?file_ids=…  轮询到非 PENDING（实测 ~2.5s SUCCESS）
+//   completion：model_type="vision" + ref_file_ids=[原始 id]（无需 fork）
+function authError(message) {
+  return Object.assign(new Error(message), { auth: true });
+}
+
+async function getPowHeader(token, targetPath, signal) {
+  const ch = await postJson(token, "/chat/create_pow_challenge", { target_path: targetPath }, signal);
+  const challenge = ch.json?.data?.biz_data?.challenge;
+  if (ch.status !== 200 || !challenge) {
+    if (looksLikeAuthFailure(ch.status, ch.text)) throw authError("userToken 已失效，请重新登录");
+    throw new Error(`获取 PoW 挑战失败：HTTP ${ch.status} ${ch.text.slice(0, 200)}`);
+  }
+  return powResponseHeader(challenge);
+}
+
+async function uploadFile(token, { mime, base64, url, name }, signal) {
+  let bytes;
+  let contentType = mime ?? "application/octet-stream";
+  if (base64) {
+    bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  } else {
+    const r = await fetch(url, { signal });
+    if (!r.ok) throw new Error(`下载图片失败：HTTP ${r.status} ${url.slice(0, 120)}`);
+    bytes = new Uint8Array(await r.arrayBuffer());
+    contentType = r.headers.get("content-type")?.split(";")[0] ?? contentType;
+  }
+  const pow = await getPowHeader(token, "/api/v0/file/upload_file", signal);
+  const fd = new FormData();
+  fd.append("file", new Blob([bytes], { type: contentType }), name);
+  const r = await fetch(`${BASE}/file/upload_file`, {
+    method: "POST",
+    signal,
+    headers: { authorization: `Bearer ${token}`, "x-ds-pow-response": pow, referer: "https://chat.deepseek.com/" },
+    body: fd,
+  });
+  const text = await r.text();
+  let j = null;
+  try { j = JSON.parse(text); } catch {}
+  const id = j?.data?.biz_data?.id;
+  if (j?.code !== 0 || !id) {
+    if (looksLikeAuthFailure(r.status, text)) throw authError("userToken 已失效，请重新登录");
+    throw new Error(`上传文件失败：${text.slice(0, 200)}`);
+  }
+  return id;
+}
+
+async function waitFilesReady(token, ids, signal, timeoutMs = 20000) {
+  const query = ids.map((i) => `file_ids=${encodeURIComponent(i)}`).join("&");
+  for (let waited = 0; waited < timeoutMs; waited += 2500) {
+    if (signal?.aborted) return;
+    const r = await fetch(`${BASE}/file/fetch_files?${query}`, { headers: { authorization: `Bearer ${token}` }, signal }).catch(() => null);
+    const j = await r?.json().catch(() => null);
+    const files = j?.data?.biz_data?.files ?? [];
+    const statuses = files.filter((f) => ids.includes(f.id)).map((f) => String(f.status ?? "").toUpperCase());
+    if (statuses.length && statuses.every((s) => s && s !== "PENDING" && s !== "PARSING" && s !== "UPLOADING" && s !== "QUEUED")) return;
+    await new Promise((res) => setTimeout(res, 2500));
+  }
+  // 超时不阻塞：参考实现 5 秒后即接受 PENDING 文件
 }
 
 function jsonError(status, message, signIn) {
@@ -241,6 +306,24 @@ async function handleChatCompletion(init, token, options) {
   const prompt = buildPrompt(messages, enableTools ? req.tools : null);
   const signal = init?.signal;
 
+  // 附件：上传到网页版后用 ref_file_ids 引用；带图片时必须走 vision 模型后端。
+  // 上传失败不静默降级——模型看不见图会胡编，显式报错让调用方重试。
+  let refFileIds = [];
+  let hasImage = false;
+  try {
+    const images = extractImages(messages);
+    const attachments = extractAttachments(messages);
+    hasImage = images.length > 0;
+    for (const f of [...images, ...attachments]) {
+      refFileIds.push(await uploadFile(token, f, signal));
+    }
+    if (refFileIds.length) await waitFilesReady(token, refFileIds, signal);
+  } catch (e) {
+    if (e?.auth) return jsonError(401, e.message, "expired");
+    if (signal?.aborted) throw e;
+    return jsonError(502, String(e?.message ?? e));
+  }
+
   const session = await postJson(token, "/chat_session/create", {}, signal);
   const sessionId = session.json?.data?.biz_data?.chat_session?.id;
   if (session.status !== 200 || !sessionId) {
@@ -272,9 +355,9 @@ async function handleChatCompletion(init, token, options) {
       body: JSON.stringify({
         chat_session_id: sessionId,
         parent_message_id: null,
-        model_type: "default",
+        model_type: hasImage ? "vision" : "default",
         prompt,
-        ref_file_ids: [],
+        ref_file_ids: refFileIds,
         thinking_enabled: def.thinking,
         search_enabled: options?.search === true,
         action: null,

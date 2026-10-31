@@ -35,6 +35,15 @@ token 等同于你的账号登录凭据，只保存在本机 magpie 的 `plugin-
 
 两者都按免费（`free: true`）声明，不占套餐额度统计。
 
+## 图片与附件
+
+请求里带图片内容（OpenAI 的 `image_url` part）时，插件会把图片上传到 DeepSeek 网页版（走它自己的 PoW 鉴权与文件解析流程），再把文件 ID 填进 `chat/completion` 的 `ref_file_ids`，并切到 `model_type: "vision"` 的视觉后端——模型真正"看图"，不是靠占位文本。
+
+- 图片来源支持 `data:` URL（base64 直传）与 `http(s)` URL（服务器侧代为下载）；相同图片自动去重；单次请求最多 8 张（多的丢弃）。
+- 非图片附件没有标准格式，插件支持扩展 part `{ type: "file", filename, file_data: "data:…;base64,…" }`，上传后同样通过 `ref_file_ids` 引用（不带图时保持 `default` 后端）。
+- 上传失败会显式报 502（模型看不见图就会胡编，不静默降级）。
+- 上传的文件会留在 DeepSeek 账号的文件列表里：接口层没有找到删除端点，插件不清理；图片解析（`fetch_files` 轮询）通常 2-3 秒完成。
+
 ## 工作原理
 
 网页版没有公开 API，插件直接走它的网页协议（2026-10 实测）：
@@ -69,6 +78,7 @@ token 等同于你的账号登录凭据，只保存在本机 magpie 的 `plugin-
 ## 限制
 
 - **工具调用是桥接的，不是原生的**：模型偶尔会输出不合协议的调用块（该次调用降级为正文），复杂智能体任务的成功率低于原生工具调用模型，跑偏时重试通常即可。
+- **图片走视觉后端**：带图请求的 `model_type` 固定为 `vision`，与网页版"图片消息"行为一致；单次最多 8 张。
 - **偶发空回答**：上游偶尔会返回 200 + 空事件流（实测与内容无关，疑似服务端瞬时异常），插件会转成显式错误（非流式 502 / 流式 error 事件）而不是静默成功，magpie 可见原因并重试或故障切换。
 - **用量是近似值**：网页版只提供会话累计 token（`accumulated_token_usage`），拆不出输入/输出，插件只填 `usage.total_tokens`，`prompt_tokens`/`completion_tokens` 记 0。
 - **不支持图片输入**：消息里的图片会被替换成占位说明。
@@ -92,7 +102,7 @@ token 等同于你的账号登录凭据，只保存在本机 magpie 的 `plugin-
 | 文件 | 作用 |
 | --- | --- |
 | `index.mjs` | 插件入口：供应商声明、登录、请求流程 |
-| `lib.mjs` | 纯函数：messages 拍平（含工具协议）、SSE 事件流 → OpenAI chunk 转换、`<tool_call>` 流式提取 |
+| `lib.mjs` | 纯函数：messages 拍平（含工具协议）、图片/附件提取、SSE 事件流 → OpenAI chunk 转换、`<tool_call>` 流式提取 |
 | `pow.mjs` | PoW 求解器（加载并调用官方 wasm） |
 | `sha3_wasm_bg.wasm` | DeepSeek 网页版自带的 sha3 wasm（`fe-static.deepseek.com` 原样拷贝） |
 | `test.mjs` | 单元测试（bun test.mjs）：拍平、协议提取、SSE 转写、空回答与鉴权映射 |
