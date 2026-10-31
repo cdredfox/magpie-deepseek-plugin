@@ -484,9 +484,11 @@ export class StreamSieve {
 // buildPromptParts 把拍平结果拆成 record（随对话增长的前缀）与 instructions（每轮重发的规则），
 // 会话复用时只发 record 的增量尾部 + instructions（见 index.mjs 的会话缓存）。
 
-// 超预算裁剪：从最老的轮次开始丢，保护最后一条用户/工具消息及其之后的所有轮次
-function pruneTurns(turns, budgetTokens) {
-  if (!budgetTokens || budgetTokens <= 0) return turns;
+// 超预算拆分：把最老的轮次导出为存档文本（archive），保护最后一条用户/工具消息及其之后的所有轮次。
+// archive 交由上层上传为附件（ref_file_ids 引用），实现"历史不丢、prompt 变小"——
+// 对应网页版"超长粘贴自动转附件"的官方行为。
+function splitForArchive(turns, budgetTokens) {
+  if (!budgetTokens || budgetTokens <= 0) return { dropped: [], kept: turns };
   const join = (list) => list.map((t) => `${t.role}：${t.text ?? ""}`).join("\n");
   let list = turns;
   let guard = list.length + 1;
@@ -500,14 +502,17 @@ function pruneTurns(turns, budgetTokens) {
         break;
       }
     }
-    if (lastProt <= 0) break; // 没有可丢的
+    if (lastProt <= 0) break; // 没有可归档的
     list = list.slice(1);
   }
-  return list;
+  const dropped = turns.slice(0, turns.length - list.length);
+  return { dropped, kept: list };
 }
 
 // 把 OpenAI chat completions 的 messages 拍平成网页版的 record + instructions 两段。
 // 带 tools 时进入工具模式（DSML 协议），插件从回答流里筛出调用块转成 OpenAI tool_calls。
+// 超出 token 预算时，最老的轮次导出为 archive（由上层上传为附件），record 只保留近期部分；
+// virtualRecord 始终是"完整记录"——会话复用的增量判定以它为准（上游经由附件+父链等价持有前缀）。
 export function buildPromptParts(messages, tools, opts = {}) {
   const toolList = (Array.isArray(tools) ? tools : []).filter((t) => t?.type === "function" && t.function?.name);
   const hasTools = toolList.length > 0;
@@ -561,8 +566,14 @@ export function buildPromptParts(messages, tools, opts = {}) {
     return lines.join("\n");
   };
 
-  let kept = pruneTurns(turns, Number(opts.maxContextTokens) > 0 ? Number(opts.maxContextTokens) : 900000);
-  const record = renderRecord(kept);
+  const budget = Number(opts.maxContextTokens) > 0 ? Number(opts.maxContextTokens) : 900000;
+  // forceArchive（新建会话且超预算）时才拆存档；复用路径不发存档（前缀已在上游会话里）
+  const { dropped, kept } = opts.forceArchive ? splitForArchive(turns, budget) : { dropped: [], kept: turns };
+  const record = opts.forceArchive ? renderRecord(kept) : renderRecord(turns);
+  const virtualRecord = renderRecord(turns);
+  const archive = dropped.length
+    ? ["[对话记录（更早部分）]", ...dropped.map((t) => `${t.role}：${t.text ?? ""}`)].join("\n")
+    : "";
   const last = kept[kept.length - 1];
 
   let instructions;
@@ -588,7 +599,7 @@ export function buildPromptParts(messages, tools, opts = {}) {
     const toolInstr = buildToolInstructions(toolList, opts.toolChoice);
     instructions = `${toolInstr}\n\n${rules.join("\n")}`;
   }
-  return { record, instructions };
+  return { record, instructions, virtualRecord, archive };
 }
 
 export function buildPrompt(messages, tools, opts) {

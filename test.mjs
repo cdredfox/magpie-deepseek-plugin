@@ -67,14 +67,14 @@ ok("图片内容替换为编号占位", () => {
 
 // ---------- 上下文裁剪与增量拆分 ----------
 console.log("buildPromptParts");
-ok("超预算裁剪：丢最老轮次、保护最后一条用户消息", () => {
+ok("复用路径不裁剪：record 始终完整（存档只在回落新会话时发生）", () => {
   const msgs = [];
   for (const q of ["第一问", "第二问", "第三问", "最后的第四问"]) {
     msgs.push({ role: "user", content: q }, { role: "assistant", content: `答：${q}` });
   }
-  const { record } = buildPromptParts(msgs, null, { maxContextTokens: 40 });
-  assert.ok(!record.includes("第一问"), "最老轮次应被裁掉");
-  assert.ok(record.includes("最后的第四问"), "最后一条用户消息必须保留");
+  const { record, archive } = buildPromptParts(msgs, null, { maxContextTokens: 40 });
+  assert.ok(record.includes("第一问") && record.includes("最后的第四问"));
+  assert.equal(archive, "");
 });
 ok("增量拆分：第二轮 record 是第一轮的延伸", () => {
   const p1 = buildPromptParts([{ role: "user", content: "Q1" }, { role: "assistant", content: "A1" }, { role: "user", content: "Q2" }], null);
@@ -102,6 +102,23 @@ ok("tool result 截断选项", () => {
     { toolResultLimit: 100 },
   );
   assert.ok(record.includes("…（截断）") && !record.includes("x".repeat(200)));
+});
+
+ok("超预算存档：forceArchive 导出最老轮次、record 只留近期", () => {
+  const msgs = [];
+  for (const q of ["第一问", "第二问", "第三问", "最后的第四问"]) {
+    msgs.push({ role: "user", content: q }, { role: "assistant", content: `答：${q}` });
+  }
+  const { record, virtualRecord, archive } = buildPromptParts(msgs, null, { maxContextTokens: 40, forceArchive: true });
+  assert.ok(!record.includes("第一问"), "record 不含已存档轮次");
+  assert.ok(record.includes("最后的第四问"));
+  assert.ok(archive.includes("第一问") && archive.includes("[对话记录（更早部分）]"));
+  assert.ok(virtualRecord.includes("第一问") && virtualRecord.includes("最后的第四问"), "virtualRecord 始终完整");
+  assert.ok(virtualRecord.startsWith(archive.replace("[对话记录（更早部分）]", "[对话记录]")));
+});
+ok("未超预算不产生存档", () => {
+  const { archive } = buildPromptParts([{ role: "user", content: "hi" }], null, { forceArchive: true });
+  assert.equal(archive, "");
 });
 
 // ---------- estimateTokens / sanitizeLeaked ----------
@@ -527,6 +544,41 @@ await okAsync("sessionReuse: false → 每轮新建并删除会话", async () =>
   assert.equal(creates, 2);
   assert.equal(deletes, 2);
   assert.equal(bodies[1].parent_message_id, null);
+});
+await okAsync("超预算回落新会话：历史打包成存档附件", async () => {
+  const bodies = [];
+  let uploads = 0;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes("/chat_session/create")) return new Response('{"code":0,"data":{"biz_data":{"chat_session":{"id":"s1"}}}}', { status: 200 });
+    if (u.includes("/chat/create_pow_challenge")) {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: { challenge: { ...REAL_CHALLENGE } } } }), { status: 200 });
+    }
+    if (u.includes("/file/upload_file")) {
+      uploads++;
+      return new Response('{"code":0,"data":{"biz_data":{"id":"file-arch","model_kind":"TEXT","status":"PENDING"}}}', { status: 200 });
+    }
+    if (u.includes("/file/fetch_files")) {
+      return new Response('{"code":0,"data":{"biz_data":{"files":[{"id":"file-arch","status":"SUCCESS","audit_result":"pass"}]}}}', { status: 200 });
+    }
+    if (u.includes("/chat/completion")) {
+      bodies.push(JSON.parse(init.body));
+      return RESP_SSE(COMPLETION_SSE_OK);
+    }
+    if (u.includes("/chat_session/delete")) return new Response('{"code":0}', { status: 200 });
+    throw new Error(`stub: 未预期的请求 ${u}`);
+  };
+  const loader = await newLoader({ sessionReuse: false, maxContextTokens: 30 });
+  const msgs = [];
+  for (const q of ["第一问", "第二问", "第三问", "最后的第四问"]) {
+    msgs.push({ role: "user", content: q }, { role: "assistant", content: `答：${q}` });
+  }
+  const r = await loader.fetch(null, { body: JSON.stringify({ model: "deepseek-chat", stream: false, messages: msgs }) });
+  assert.equal(r.status, 200);
+  assert.equal(uploads, 1, "存档上传一次");
+  assert.equal(bodies[0].ref_file_ids[0], "file-arch", "存档附件排第一");
+  assert.ok(bodies[0].prompt.includes("历史对话已作为附件"), "prompt 带存档说明");
+  assert.ok(bodies[0].prompt.includes("最后的第四问") && !bodies[0].prompt.includes("第一问"), "prompt 只留近期");
 });
 await okAsync("40003/INVALID_TOKEN → 401 + 登录标记", async () => {
   globalThis.fetch = async (url) => {

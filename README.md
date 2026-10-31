@@ -60,6 +60,10 @@ token 等同于你的账号登录凭据，只保存在本机 magpie 的 `plugin-
 
 鉴权只需要 `Authorization: Bearer <userToken>`；PoW 是唯一的服务端强制校验。所有请求都带完整浏览器头（UA/Origin/Referer/Sec-Ch-Ua/X-Client-* 等）。
 
+### 超长历史：自动转存附件
+
+单条 prompt 太长会触发上游限流甚至失败。网页版自己的做法是"超长粘贴转附件"，插件同样如此：当拍平后的历史超过 token 预算且需要新建会话时，最老的轮次被打包成 `对话历史存档.md` 上传（`ref_file_ids` 引用，按内容哈希去重），prompt 只保留近期对话并注明"历史见附件"——**记忆不丢、prompt 变小**。复用中的会话不重复上传（前缀已在服务端会话里）。
+
 ### 多轮对话与会话复用
 
 网页版接口只接受一条 `prompt`。插件把 OpenAI 的 `messages` 拍平成"记录前缀 + 回复规则"两段，并按账号缓存最近 4 个对话的会话：
@@ -134,7 +138,7 @@ token 等同于你的账号登录凭据，只保存在本机 magpie 的 `plugin-
 - `keepSessions`：`true` 时保留所有会话（能在网页版历史里看到），默认用完即删（复用模式下按 TTL）。
 - `search`：`true` 时允许网页版联网搜索；也可直接选 `deepseek-search` 模型。
 - `sessionReuse`：会话复用 + 增量提示，默认开。关闭则每轮新建会话、全量重发、用完即删。
-- `maxContextTokens`：拍平记录的 token 预算，超限从最老轮次开始裁剪（保护最后一条用户消息），默认 900000。
+- `maxContextTokens`：拍平记录的 token 预算，默认 900000（1M 留余量）。超预算时**最老轮次打包成文本附件**（`对话历史存档.md`，走 `ref_file_ids` 引用——对应网页版"超长粘贴自动转附件"的官方行为），prompt 只保留近期对话，历史不丢失。
 - `toolResultLimit`：工具结果截断长度（字符），0 = 不截断（默认）。长工具输出撑爆上下文时可设置。
 - `retryAttempts`：空回答重试次数（每次换新会话），默认 3；1 = 关闭。
 - `retryBackoffMs`：空回答退避基数（毫秒），线性放大，默认 1500。

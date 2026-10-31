@@ -438,13 +438,44 @@ async function handleChatCompletion(init, token, options) {
     : [5000, 15000];
   const jitterMs = Math.max(0, Number(options?.jitterMs) || 0);
 
-  // 组装 prompt（record 随对话增长；instructions 每轮重发）
-  const parts = buildPromptParts(messages, enableTools ? req.tools : null, {
+  // 组装 prompt：record 随对话增长；instructions 每轮重发。
+  // 超预算时**不在复用路径**存档（前缀已在上游会话里）——只有回落到新会话才拆存档上传。
+  const buildOpts = {
     toolChoice: req.tool_choice,
     maxContextTokens,
     toolResultLimit: options?.toolResultLimit,
-  });
-  const promptFull = parts.instructions ? (parts.record ? `${parts.record}\n\n${parts.instructions}` : parts.instructions) : parts.record;
+  };
+  let parts = buildPromptParts(messages, enableTools ? req.tools : null, buildOpts);
+  const assemble = (p) => (p.instructions ? (p.record ? `${p.record}\n\n${p.instructions}` : p.instructions) : p.record);
+  let useArchive = false;
+  let archiveFileId = null;
+  const ensureArchive = async () => {
+    if (!useArchive || archiveFileId) return;
+    const bytes = new TextEncoder().encode(parts.archive);
+    const digest = await sha256Hex(bytes);
+    let fileId = fileCache.get(token)?.get(digest);
+    if (!fileId) {
+      const up = await uploadBytes(token, bytes, "text/markdown", "对话历史存档.md", signal, {
+        modelType: "default",
+        thinking: false,
+      });
+      fileId = up.id;
+      cacheFileId(token, digest, fileId);
+    }
+    archiveFileId = fileId;
+    refFileIds = [fileId, ...refFileIds.filter((id) => id !== fileId)];
+  };
+  const promptFor = (attempt) => {
+    if (attempt === 1 && reuseKind === "delta" && reuseEntry) {
+      const tail = parts.record.slice(reuseEntry.record.length).replace(/^\n+/, "");
+      return parts.instructions ? `${tail}\n\n${parts.instructions}` : tail;
+    }
+    // 新会话：超预算则带历史存档附件
+    if (useArchive) {
+      return `[历史对话已作为附件提供（见附件列表第一项），请先阅读附件了解前情。]\n${assemble(parts)}`;
+    }
+    return assemble(parts);
+  };
 
   // 会话复用判定：record 延伸 → 增量；相同 → 重试原样重发；发散/超限 → 新会话
   let reuseEntry = null;
@@ -460,6 +491,11 @@ async function handleChatCompletion(init, token, options) {
       reuseEntry = best;
       reuseKind = parts.record === best.record ? "same" : "delta";
     }
+  }
+  // 无会话可复用且历史超预算：拆存档（新会话首条消息带历史附件）
+  if (!reuseEntry && estimateTokens(parts.record) > maxContextTokens) {
+    parts = buildPromptParts(messages, enableTools ? req.tools : null, { ...buildOpts, forceArchive: true });
+    useArchive = true;
   }
 
   // 附件：上传（digest 去重）→ 轮询解析 → ref_file_ids；带图片走 vision 后端。
@@ -522,12 +558,13 @@ async function handleChatCompletion(init, token, options) {
       if (!keepSessions) deleteSession(token, sessionId);
     };
     try {
+      if (!reused) await ensureArchive();
       const header = await getPowHeader(token, "/api/v0/chat/completion", signal, jitterMs);
       const body = {
         chat_session_id: sessionId,
         parent_message_id: reused ? reuseParentId : null,
         model_type: hasImage ? "vision" : "default",
-        prompt: attemptPrompt(attempt),
+        prompt: promptFor(attempt),
         ref_file_ids: refFileIds,
         thinking_enabled: def.thinking,
         search_enabled: def.search === true || options?.search === true,
@@ -571,8 +608,8 @@ async function handleChatCompletion(init, token, options) {
             cachePut(
               token,
               {
-                key: `${parts.record.length}:${parts.record.slice(0, 256)}`,
-                record: parts.record,
+                key: `${parts.virtualRecord.length}:${parts.virtualRecord.slice(0, 256)}`,
+                record: parts.virtualRecord,
                 sessionId,
                 parentMessageId: responseMessageId ?? null,
                 sentAt: Date.now(),
@@ -656,6 +693,12 @@ async function handleChatCompletion(init, token, options) {
       } else {
         return jsonError(502, verdict.kind === "rateLimit" ? "DeepSeek 上游限流（消息发送过于频繁），已自动重试仍被拒，请稍后再试或增加账号" : EMPTY_RESPONSE_MSG);
       }
+      if (estimateTokens(parts.record) > maxContextTokens) {
+        // 回落新会话且历史超预算：把最老轮次打包成附件，prompt 只留近期部分
+        parts = buildPromptParts(messages, enableTools ? req.tools : null, { ...buildOpts, forceArchive: true });
+        useArchive = true;
+        await ensureArchive();
+      }
       opened = await openOrFail(attempt);
       if (isResponse(opened)) return opened;
     }
@@ -707,6 +750,11 @@ async function handleChatCompletion(init, token, options) {
               await sleep(retryBackoffMs * emptyCount);
             }
             attempt++;
+            if (estimateTokens(parts.record) > maxContextTokens) {
+              parts = buildPromptParts(messages, enableTools ? req.tools : null, { ...buildOpts, forceArchive: true });
+              useArchive = true;
+            }
+            await ensureArchive();
             opened = await openUpstream(attempt);
             currentDiscard = () => opened.finish(false);
             continue;
