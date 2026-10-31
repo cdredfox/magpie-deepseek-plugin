@@ -61,6 +61,42 @@ const MAX_CONTEXT_TOKENS = 900000; // 1M 留 10%（freeapi 的 session 续期阈
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---- Cookie jar（按账号 token 隔离）----
+// 浏览器能"好多天不失效"的关键：上游每个响应都会下发 WAF/会话 cookie
+// （HWWAFSESID/HWWAFSESTIME/ds_session_id 等），浏览器自动保存回传。
+// 静态 token 不带 cookie 时，风控很快以 "Authorization Failed (invalid token)" 踢掉。
+// 这里照搬浏览器行为：所有响应的 Set-Cookie 收进 jar，后续请求全部回传。
+const cookieJars = new Map(); // token → Map<name, value>
+
+function absorbCookies(token, res) {
+  const sc = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
+  if (!sc.length) return;
+  let jar = cookieJars.get(token);
+  if (!jar) {
+    jar = new Map();
+    cookieJars.set(token, jar);
+  }
+  for (const line of sc) {
+    const [pair] = line.split(";");
+    const eq = pair.indexOf("=");
+    if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+}
+
+function cookieHeader(token) {
+  const jar = cookieJars.get(token);
+  return jar?.size ? [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ") : undefined;
+}
+
+async function dsFetch(token, url, init) {
+  const headers = { ...(init?.headers ?? {}) };
+  const cookie = cookieHeader(token);
+  if (cookie) headers.cookie = cookie;
+  const res = await fetch(url, { ...init, headers });
+  absorbCookies(token, res);
+  return res;
+}
+
 function authError(message) {
   return Object.assign(new Error(message), { auth: true });
 }
@@ -89,7 +125,7 @@ function wafKind(response) {
 }
 
 async function postJson(token, path, body, signal) {
-  const r = await fetch(`${BASE}${path}`, {
+  const r = await dsFetch(token, `${BASE}${path}`, {
     method: "POST",
     signal,
     headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...BROWSER_HEADERS },
@@ -148,7 +184,7 @@ async function uploadBytes(token, bytes, contentType, name, signal, { modelType,
   const pow = await getPowHeader(token, "/api/v0/file/upload_file", signal, 0);
   const fd = new FormData();
   fd.append("file", new Blob([bytes], { type: contentType }), name);
-  const r = await fetch(`${BASE}/file/upload_file`, {
+  const r = await dsFetch(token, `${BASE}/file/upload_file`, {
     method: "POST",
     signal,
     headers: {
@@ -179,7 +215,7 @@ async function waitFilesReady(token, ids, signal, timeoutMs = 20000) {
   const query = ids.map((i) => `file_ids=${encodeURIComponent(i)}`).join("&");
   for (let waited = 0; waited < timeoutMs; waited += 2000) {
     if (signal?.aborted) return;
-    const r = await fetch(`${BASE}/file/fetch_files?${query}`, { headers: { authorization: `Bearer ${token}`, ...BROWSER_HEADERS }, signal }).catch(() => null);
+    const r = await dsFetch(token, `${BASE}/file/fetch_files?${query}`, { headers: { authorization: `Bearer ${token}`, ...BROWSER_HEADERS }, signal }).catch(() => null);
     const j = await r?.json().catch(() => null);
     const files = j?.data?.biz_data?.files ?? [];
     const mine = files.filter((f) => ids.includes(f.id));
@@ -574,7 +610,7 @@ async function handleChatCompletion(init, token, options) {
       if (typeof req.temperature === "number") body.temperature = req.temperature;
       if (typeof req.top_p === "number") body.top_p = req.top_p;
       if (typeof req.max_tokens === "number") body.max_tokens = req.max_tokens;
-      const upstream = await fetch(`${BASE}/chat/completion`, {
+      const upstream = await dsFetch(token, `${BASE}/chat/completion`, {
         method: "POST",
         signal,
         headers: { "content-type": "application/json", authorization: `Bearer ${token}`, "x-ds-pow-response": header, ...BROWSER_HEADERS },
@@ -837,7 +873,7 @@ export const DeepSeekWebPlugin = async (_input, options) => ({
       key = key.replace(/^"+|"+$/g, "").trim();
       if (!key) return { type: "failed", error: "请粘贴 userToken" };
       try {
-        const r = await fetch(`${BASE}/users/current`, { headers: { authorization: `Bearer ${key}`, ...BROWSER_HEADERS } });
+        const r = await dsFetch(key, `${BASE}/users/current`, { headers: { authorization: `Bearer ${key}`, ...BROWSER_HEADERS } });
         if (r.status === 401) return { type: "failed", error: "userToken 无效或已过期" };
         if (!r.ok) return { type: "failed", error: `DeepSeek 返回 HTTP ${r.status}` };
         const j = await r.json();
@@ -854,7 +890,7 @@ export const DeepSeekWebPlugin = async (_input, options) => ({
       const auth = await getAuth();
       if (auth?.type !== "api" || !auth.key) return { windows: [] };
       try {
-        const r = await fetch(`${BASE}/users/current`, { headers: { authorization: `Bearer ${auth.key}`, ...BROWSER_HEADERS } });
+        const r = await dsFetch(auth.key, `${BASE}/users/current`, { headers: { authorization: `Bearer ${auth.key}`, ...BROWSER_HEADERS } });
         if (r.status === 401) return { error: "userToken 已失效，请重新登录", signIn: "expired", windows: [] };
         if (!r.ok) return { error: `DeepSeek 返回 HTTP ${r.status}`, windows: [] };
         const j = await r.json();
